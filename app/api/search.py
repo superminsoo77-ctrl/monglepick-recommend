@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_current_user_optional, get_db, get_redis_client
 from app.model.schema import (
     AutocompleteResponse,
+    MovieDetailResponse,
     MovieSearchResponse,
     RecentSearchResponse,
     TrendingResponse,
@@ -106,6 +107,32 @@ async def search_movies(
         size=size,
         user_id=user_id,
     )
+
+
+@router.get(
+    "/movies/{movie_id}",
+    response_model=MovieDetailResponse,
+    summary="영화 상세 조회",
+    description="영화 ID로 상세 정보를 조회합니다.",
+)
+async def get_movie_detail(
+    movie_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    영화 상세 조회 엔드포인트
+
+    검색 결과에서 선택한 영화의 상세 메타 정보를 반환합니다.
+    인증 없이 접근 가능합니다.
+    """
+    service = SearchService(db)
+    try:
+        return await service.get_movie_detail(movie_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get(

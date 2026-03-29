@@ -14,7 +14,7 @@ DDL 기준: movie_id VARCHAR(50) PK, release_year INT, genres JSON
 - director 컬럼 직접 검색: DDL에 director VARCHAR(200) 존재
 """
 
-from sqlalchemy import Select, func, select, text
+from sqlalchemy import Select, String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.model.entity import Movie
@@ -29,6 +29,12 @@ class MovieRepository:
             session: SQLAlchemy 비동기 세션
         """
         self._session = session
+
+    @property
+    def _dialect_name(self) -> str:
+        """현재 세션이 연결된 DB dialect 이름을 반환합니다."""
+        bind = self._session.bind
+        return bind.dialect.name if bind is not None else ""
 
     async def search(
         self,
@@ -74,8 +80,20 @@ class MovieRepository:
             keyword_stripped = keyword.strip()
             # LIKE 패턴 생성 (양쪽 와일드카드)
             like_pattern = f"%{keyword_stripped}%"
+            actor_like = f"%{keyword_stripped}%"
 
-            if search_type == "title" or search_type == "all":
+            if search_type == "all":
+                # 통합 검색: 제목 + 감독 + 배우를 OR 조건으로 묶어 검색
+                all_condition = or_(
+                    Movie.title.ilike(like_pattern),
+                    Movie.title_en.ilike(like_pattern),
+                    Movie.director.ilike(like_pattern),
+                    self._json_text_like(Movie.cast, actor_like),
+                )
+                query = query.where(all_condition)
+                count_query = count_query.where(all_condition)
+                
+            elif search_type == "title":
                 # 제목 검색: 한국어 제목 + 영어 원제 모두 검색
                 query = query.where(
                     (Movie.title.ilike(like_pattern)) |
@@ -85,29 +103,26 @@ class MovieRepository:
                     (Movie.title.ilike(like_pattern)) |
                     (Movie.title_en.ilike(like_pattern))
                 )
+                
             elif search_type == "director":
                 # 감독 검색: DDL에 director VARCHAR(200) 컬럼 존재
                 query = query.where(Movie.director.ilike(like_pattern))
                 count_query = count_query.where(Movie.director.ilike(like_pattern))
+                
             elif search_type == "actor":
                 # 배우 검색: cast JSON 컬럼에서 LIKE로 검색
-                # (JSON_SEARCH 대신 LIKE 사용 — MySQL/SQLite 공통 호환)
-                actor_like = f"%{keyword_stripped}%"
                 query = query.where(Movie.cast.isnot(None))
-                query = query.where(text("CAST(\"cast\" AS TEXT) LIKE :actor_val").bindparams(actor_val=actor_like))
+                query = query.where(self._json_text_like(Movie.cast, actor_like))
                 count_query = count_query.where(Movie.cast.isnot(None))
-                count_query = count_query.where(text("CAST(\"cast\" AS TEXT) LIKE :actor_val").bindparams(actor_val=actor_like))
+                count_query = count_query.where(self._json_text_like(Movie.cast, actor_like))
 
         # ─────────────────────────────────────
         # 장르 필터 (JSON_CONTAINS 사용)
         # ─────────────────────────────────────
         if genre:
-            # 장르 필터: JSON 배열에 해당 장르가 포함되어 있는지 LIKE로 확인
-            # (JSON_CONTAINS 대신 LIKE 사용 — MySQL/SQLite 공통 호환)
-            genre_like = f'%"{genre}"%'
-            genre_condition = text("CAST(genres AS TEXT) LIKE :genre_val")
-            query = query.where(genre_condition.bindparams(genre_val=genre_like))
-            count_query = count_query.where(genre_condition.bindparams(genre_val=genre_like))
+            genre_condition = self._json_array_contains(Movie.genres, genre)
+            query = query.where(genre_condition)
+            count_query = count_query.where(genre_condition)
 
         # ─────────────────────────────────────
         # 연도 필터 (release_year INT 컬럼 직접 비교)
@@ -209,7 +224,7 @@ class MovieRepository:
         prefix_query = (
             select(Movie.title)
             .where(Movie.title.ilike(f"{prefix_stripped}%"))
-            .order_by(Movie.rating.desc().nullslast())
+            .order_by(*self._nulls_last_order(Movie.rating, descending=True))
             .limit(limit)
         )
         result = await self._session.execute(prefix_query)
@@ -224,7 +239,7 @@ class MovieRepository:
                     Movie.title.ilike(f"%{prefix_stripped}%"),
                     ~Movie.title.ilike(f"{prefix_stripped}%"),  # 이미 포함된 것 제외
                 )
-                .order_by(Movie.rating.desc().nullslast())
+                .order_by(*self._nulls_last_order(Movie.rating, descending=True))
                 .limit(remaining)
             )
             result = await self._session.execute(contains_query)
@@ -252,14 +267,10 @@ class MovieRepository:
         Returns:
             해당 장르의 대표 영화 목록
         """
-        # 장르 필터: LIKE로 JSON 배열 내 장르 검색 (MySQL/SQLite 공통 호환)
-        genre_like = f'%"{genre}"%'
-        genre_condition = text("CAST(genres AS TEXT) LIKE :genre_val")
-
         query = (
             select(Movie)
             .where(
-                genre_condition.bindparams(genre_val=genre_like),
+                self._json_array_contains(Movie.genres, genre),
                 Movie.rating >= min_rating,
                 Movie.poster_path.isnot(None),  # 포스터가 있는 영화만
             )
@@ -296,16 +307,12 @@ class MovieRepository:
         seen_ids: set[str] = set()  # 중복 방지 (movie_id VARCHAR(50))
 
         for genre in genres:
-            # 장르 필터: LIKE로 JSON 배열 내 장르 검색 (MySQL/SQLite 공통 호환)
-            genre_like = f'%"{genre}"%'
-            genre_condition = text("CAST(genres AS TEXT) LIKE :genre_val")
-
             # RANDOM()으로 랜덤 선택, 포스터 있는 영화만
             # (MySQL: RAND(), SQLite: RANDOM() — func.random()은 양쪽 호환)
             query = (
                 select(Movie)
                 .where(
-                    genre_condition.bindparams(genre_val=genre_like),
+                    self._json_array_contains(Movie.genres, genre),
                     Movie.rating >= min_rating,
                     Movie.poster_path.isnot(None),
                 )
@@ -395,6 +402,30 @@ class MovieRepository:
         column = sort_column_map.get(sort_by, Movie.rating)
 
         if sort_order == "asc":
-            return query.order_by(column.asc().nullslast())
+            return query.order_by(*self._nulls_last_order(column, descending=False))
         else:
-            return query.order_by(column.desc().nullslast())
+            return query.order_by(*self._nulls_last_order(column, descending=True))
+
+    def _json_text_like(self, column, pattern: str):
+        """JSON/배열 컬럼을 문자열로 캐스팅해 LIKE 검색 조건을 생성합니다."""
+        return cast(column, String).like(pattern)
+
+    def _json_array_contains(self, column, value: str):
+        """
+        JSON 배열 포함 여부 조건을 생성합니다.
+
+        MySQL에서는 JSON_CONTAINS를 사용하고, 테스트용 SQLite에서는 문자열 LIKE로 폴백합니다.
+        """
+        if self._dialect_name == "mysql":
+            return func.json_contains(column, func.json_quote(value)) == 1
+        return self._json_text_like(column, f'%"{value}"%')
+
+    def _nulls_last_order(self, column, *, descending: bool):
+        """
+        NULL 값을 마지막으로 보내는 정렬 절을 반환합니다.
+
+        MySQL은 `NULLS LAST` 구문을 지원하지 않아, `column IS NULL`을 먼저 정렬해
+        NULL이 아닌 값을 앞쪽으로 배치합니다.
+        """
+        direction = column.desc() if descending else column.asc()
+        return (column.is_(None), direction)

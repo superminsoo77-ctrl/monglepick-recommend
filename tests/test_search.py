@@ -43,6 +43,7 @@ async def _insert_test_movies(session: AsyncSession) -> list[Movie]:
             rating=8.6,
             poster_path="/interstellar.jpg",
             director="크리스토퍼 놀란",
+            trailer_url="https://youtu.be/zSWdZVtXT7E",
         ),
         Movie(
             movie_id="200",
@@ -113,6 +114,37 @@ async def test_search_movies_by_title(client: AsyncClient, async_session: AsyncS
     data = response.json()
     assert len(data["movies"]) == 1
     assert data["movies"][0]["title"] == "인터스텔라"
+    assert data["movies"][0]["trailer_url"] == "https://youtu.be/zSWdZVtXT7E"
+
+
+@pytest.mark.asyncio
+async def test_search_movies_all_includes_director_and_actor(
+    client: AsyncClient, async_session: AsyncSession
+):
+    """all 검색은 제목/감독/배우를 모두 포함합니다."""
+    await _insert_test_movies(async_session)
+
+    # 감독 이름으로 all 검색
+    director_response = await client.get(
+        "/api/v1/search/movies",
+        params={"q": "봉준호", "search_type": "all"},
+    )
+    assert director_response.status_code == 200
+    director_data = director_response.json()
+    assert any(movie["title"] == "기생충" for movie in director_data["movies"])
+
+    # 배우 이름으로 all 검색 (cast JSON LIKE 경로)
+    movie = await async_session.get(Movie, "100")
+    movie.cast = ["매튜 맥커너히", "앤 해서웨이"]
+    await async_session.flush()
+
+    actor_response = await client.get(
+        "/api/v1/search/movies",
+        params={"q": "매튜 맥커너히", "search_type": "all"},
+    )
+    assert actor_response.status_code == 200
+    actor_data = actor_response.json()
+    assert any(movie["title"] == "인터스텔라" for movie in actor_data["movies"])
 
 
 @pytest.mark.asyncio
@@ -168,6 +200,28 @@ async def test_search_movies_rating_filter(client: AsyncClient, async_session: A
     # 평점 8.5 이상인 영화만 반환
     for movie in data["movies"]:
         assert movie["rating"] >= 8.5
+
+
+@pytest.mark.asyncio
+async def test_search_movies_director_with_genre_filter(
+    client: AsyncClient, async_session: AsyncSession
+):
+    """감독 검색과 장르 필터를 함께 적용할 수 있습니다."""
+    await _insert_test_movies(async_session)
+
+    response = await client.get(
+        "/api/v1/search/movies",
+        params={
+            "q": "데이미언 셔젤",
+            "search_type": "director",
+            "genre": "로맨스",
+        },
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["pagination"]["total"] == 1
+    assert data["movies"][0]["title"] == "라라랜드"
 
 
 # =========================================
