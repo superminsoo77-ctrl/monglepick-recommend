@@ -26,6 +26,7 @@ from app.config import get_settings
 from app.model.entity import Movie
 from app.model.schema import (
     MovieBrief,
+    MovieDetailResponse,
     MovieSearchResponse,
     PaginationMeta,
     RecentSearchItem,
@@ -41,11 +42,11 @@ logger = logging.getLogger(__name__)
 class SearchService:
     """영화 검색 비즈니스 로직 서비스"""
 
-    def __init__(self, session: AsyncSession, redis_client: aioredis.Redis):
+    def __init__(self, session: AsyncSession, redis_client: aioredis.Redis | None = None):
         """
         Args:
             session: SQLAlchemy 비동기 세션
-            redis_client: Redis 비동기 클라이언트
+            redis_client: Redis 비동기 클라이언트 (상세 조회 전용 사용 시 None 가능)
         """
         self._session = session
         self._redis = redis_client
@@ -130,10 +131,11 @@ class SearchService:
                     logger.warning(f"검색 이력 저장 실패 (user_id={user_id}): {e}")
 
             # Redis 인기 검색어 점수 증가 (Sorted Set)
-            try:
-                await self._redis.zincrby("trending:keywords", 1, keyword_cleaned)
-            except Exception as e:
-                logger.warning(f"Redis 인기 검색어 갱신 실패: {e}")
+            if self._redis is not None:
+                try:
+                    await self._redis.zincrby("trending:keywords", 1, keyword_cleaned)
+                except Exception as e:
+                    logger.warning(f"Redis 인기 검색어 갱신 실패: {e}")
 
             # MySQL 인기 검색어 백업 (비동기, 실패해도 무시)
             try:
@@ -173,6 +175,24 @@ class SearchService:
             for r in records
         ]
         return RecentSearchResponse(searches=items)
+
+    async def get_movie_detail(self, movie_id: str) -> MovieDetailResponse:
+        """
+        영화 상세 정보를 반환합니다.
+
+        Args:
+            movie_id: 영화 ID
+
+        Returns:
+            MovieDetailResponse: 상세 정보
+
+        Raises:
+            ValueError: 해당 영화를 찾지 못한 경우
+        """
+        movie = await self._movie_repo.find_by_id(movie_id)
+        if movie is None:
+            raise ValueError(f"영화 ID '{movie_id}'를 찾을 수 없습니다.")
+        return self._to_movie_detail(movie)
 
     async def delete_recent_keyword(self, user_id: str, keyword: str) -> bool:
         """
@@ -228,5 +248,60 @@ class SearchService:
             release_year=movie.release_year,
             rating=movie.rating,
             poster_url=poster_url,
+            trailer_url=movie.trailer_url,
             overview=movie.overview,
+        )
+
+    def _to_movie_detail(self, movie: Movie) -> MovieDetailResponse:
+        """
+        Movie 엔티티를 MovieDetailResponse로 변환합니다.
+
+        Args:
+            movie: Movie 엔티티
+
+        Returns:
+            MovieDetailResponse Pydantic 모델
+        """
+        poster_url = None
+        if movie.poster_path:
+            poster_url = f"{self._settings.TMDB_IMAGE_BASE_URL}{movie.poster_path}"
+
+        backdrop_url = None
+        if movie.backdrop_path:
+            backdrop_url = f"{self._settings.TMDB_IMAGE_BASE_URL}{movie.backdrop_path}"
+
+        release_date = None
+        if movie.kobis_open_dt and len(movie.kobis_open_dt) == 8 and movie.kobis_open_dt.isdigit():
+            release_date = (
+                f"{movie.kobis_open_dt[:4]}-{movie.kobis_open_dt[4:6]}-{movie.kobis_open_dt[6:8]}"
+            )
+        elif movie.release_year:
+            release_date = f"{movie.release_year}-01-01"
+
+        return MovieDetailResponse(
+            movie_id=movie.movie_id,
+            title=movie.title,
+            original_title=movie.title_en,
+            genres=movie.get_genres_list(),
+            release_year=movie.release_year,
+            release_date=release_date,
+            runtime=movie.runtime,
+            rating=movie.rating,
+            vote_count=movie.vote_count,
+            popularity_score=movie.popularity_score,
+            poster_url=poster_url,
+            backdrop_url=backdrop_url,
+            director=movie.director,
+            cast=movie.get_cast_list(),
+            certification=movie.certification,
+            trailer_url=movie.trailer_url,
+            overview=movie.overview,
+            tagline=movie.tagline,
+            imdb_id=movie.imdb_id,
+            original_language=movie.original_language,
+            collection_name=movie.collection_name,
+            kobis_open_dt=movie.kobis_open_dt,
+            awards=movie.awards,
+            filming_location=movie.filming_location,
+            source=movie.source,
         )

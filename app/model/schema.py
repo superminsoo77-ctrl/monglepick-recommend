@@ -34,10 +34,46 @@ class MovieBrief(BaseModel):
     release_year: int | None = Field(default=None, description="개봉 연도")
     rating: float | None = Field(default=None, description="평균 평점 (0.0~10.0)")
     poster_url: str | None = Field(default=None, description="포스터 이미지 전체 URL")
+    trailer_url: str | None = Field(default=None, description="예고편 URL")
     overview: str | None = Field(default=None, description="줄거리 요약")
 
     class Config:
         from_attributes = True
+
+
+class MovieDetailResponse(BaseModel):
+    """
+    영화 상세 정보 응답
+
+    상세 페이지에서 사용하는 영화 단건 조회 응답입니다.
+    movies 테이블의 주요 메타 정보를 포함하고,
+    포스터/배경 이미지 URL은 TMDB 베이스 URL과 조합된 값을 반환합니다.
+    """
+    movie_id: str = Field(description="영화 ID (VARCHAR(50), TMDB/KOBIS/KMDb)")
+    title: str = Field(description="한국어 제목")
+    original_title: str | None = Field(default=None, description="영어 원제")
+    genres: list[str] = Field(default_factory=list, description="장르 목록")
+    release_year: int | None = Field(default=None, description="개봉 연도")
+    release_date: str | None = Field(default=None, description="개봉일 (YYYY-MM-DD)")
+    runtime: int | None = Field(default=None, description="상영 시간 (분)")
+    rating: float | None = Field(default=None, description="평균 평점 (0.0~10.0)")
+    vote_count: int | None = Field(default=None, description="투표 수")
+    popularity_score: float | None = Field(default=None, description="TMDB 인기도 점수")
+    poster_url: str | None = Field(default=None, description="포스터 이미지 전체 URL")
+    backdrop_url: str | None = Field(default=None, description="배경 이미지 전체 URL")
+    director: str | None = Field(default=None, description="감독")
+    cast: list[str] = Field(default_factory=list, description="출연진 목록")
+    certification: str | None = Field(default=None, description="관람 등급")
+    trailer_url: str | None = Field(default=None, description="예고편 URL")
+    overview: str | None = Field(default=None, description="줄거리")
+    tagline: str | None = Field(default=None, description="태그라인")
+    imdb_id: str | None = Field(default=None, description="IMDb ID")
+    original_language: str | None = Field(default=None, description="원본 언어 코드")
+    collection_name: str | None = Field(default=None, description="프랜차이즈/컬렉션 이름")
+    kobis_open_dt: str | None = Field(default=None, description="KOBIS 개봉일 (YYYYMMDD)")
+    awards: str | None = Field(default=None, description="수상 내역")
+    filming_location: str | None = Field(default=None, description="촬영 장소")
+    source: str | None = Field(default=None, description="데이터 출처")
 
 
 class PaginationMeta(BaseModel):

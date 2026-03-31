@@ -204,5 +204,6 @@ class OnboardingService:
             release_year=movie.release_year,
             rating=movie.rating,
             poster_url=poster_url,
+            trailer_url=movie.trailer_url,
             overview=movie.overview,
         )
