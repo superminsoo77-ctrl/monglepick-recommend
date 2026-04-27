@@ -93,6 +93,36 @@ _THEATER_WORDS = ["CGV", "메가박스", "MEGABOX", "롯데시네마", "씨네�
 
 
 # ──────────────────────────────────────────────
+# 섹션 분리 ([TOP]/[MIDDLE]/[BOTTOM] 태그)
+# ──────────────────────────────────────────────
+def _parse_section_tags(text: str) -> dict:
+    """
+    [TOP]/[MIDDLE]/[BOTTOM] 태그로 구분된 텍스트를 섹션별로 분리.
+    태그가 없으면 모든 섹션이 빈 문자열로 반환된다.
+    full 키는 태그를 제거한 전체 내용을 담는다.
+    """
+    section_lines: dict = {"top": [], "middle": [], "bottom": []}
+    all_content: List[str] = []
+    current: Optional[str] = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped in ("[TOP]", "[MIDDLE]", "[BOTTOM]"):
+            current = stripped[1:-1].lower()
+        else:
+            if current:
+                section_lines[current].append(line)
+            all_content.append(line)
+
+    return {
+        "top":    "\n".join(section_lines["top"]),
+        "middle": "\n".join(section_lines["middle"]),
+        "bottom": "\n".join(section_lines["bottom"]),
+        "full":   "\n".join(all_content),
+    }
+
+
+# ──────────────────────────────────────────────
 # 텍스트 정규화
 # ──────────────────────────────────────────────
 def _normalize_whitespace(text: str) -> str:
@@ -933,6 +963,7 @@ def _determine_status(
 def parse_receipt(text: str, fallback_texts: Optional[List[str]] = None) -> dict:
     """
     OCR 텍스트에서 영화 관람 정보를 추출한다.
+    [TOP]/[MIDDLE]/[BOTTOM] 섹션 태그가 있으면 영역별 우선순위를 적용한다.
 
     Returns dict with keys:
         movie_name, watch_date, headcount, seat, screening_time, theater, venue,
@@ -943,14 +974,45 @@ def parse_receipt(text: str, fallback_texts: Optional[List[str]] = None) -> dict
     text = _normalize_ocr_text(text)
     logger.info("OCR RAW TEXT:\n%s", text)
 
-    movie_name, movie_score = _extract_movie_name(text)
-    watch_date     = _extract_watch_date(text)
-    headcount      = _extract_with_fallback(_extract_headcount,      text, fallback_texts, "인원 수")
-    seat           = _extract_with_fallback(_extract_seat,           text, fallback_texts, "좌석")
-    screening_time = _extract_with_fallback(_extract_screening_time, text, fallback_texts, "상영 시간")
-    theater        = _extract_with_fallback(_extract_theater,        text, fallback_texts, "상영관")
-    venue          = _extract_with_fallback(_extract_venue,          text, fallback_texts, "영화관")
-    watched_at     = _combine_watched_at(watch_date, screening_time)
+    secs = _parse_section_tags(text)
+    has_sections = bool(secs["top"] or secs["middle"])
+
+    # 영역별 텍스트 준비 (섹션 없으면 전체 텍스트로 fallback)
+    top  = secs["top"]    or text   # 영화명·날짜·시간·영화관 우선
+    mid  = secs["middle"] or text   # 인원·좌석·상영관 우선
+    full = secs["full"]   or text   # 태그 제거 전체
+    # bottom: 영화명에 사용하지 않고 인원 보조에만 참고
+
+    # 영화명: top+middle 우선, bottom 제외
+    top_mid = "\n".join(filter(None, [secs["top"], secs["middle"]])) or text
+    movie_name, movie_score = _extract_movie_name(top_mid)
+    if not movie_name and has_sections:
+        movie_name, movie_score = _extract_movie_name(full)
+
+    # 관람일·상영시간: top 우선
+    watch_date     = _extract_watch_date(top)
+    screening_time = _extract_screening_time(top)
+    if has_sections:
+        if not watch_date:
+            watch_date = _extract_watch_date(full)
+        if not screening_time:
+            screening_time = _extract_screening_time(full)
+
+    # 인원: middle 우선 → full → fallback_texts
+    _mid_fallbacks = ([full] if has_sections else []) + (fallback_texts or [])
+    headcount = _extract_with_fallback(_extract_headcount, mid, _mid_fallbacks, "인원 수")
+
+    # 좌석: middle 우선 → full → fallback_texts
+    seat = _extract_with_fallback(_extract_seat, mid, _mid_fallbacks, "좌석")
+
+    # 상영관: middle 우선 → full → fallback_texts
+    theater = _extract_with_fallback(_extract_theater, mid, _mid_fallbacks, "상영관")
+
+    # 영화관 지점: top 우선 → full → fallback_texts
+    _top_fallbacks = ([full] if has_sections else []) + (fallback_texts or [])
+    venue = _extract_with_fallback(_extract_venue, top, _top_fallbacks, "영화관")
+
+    watched_at = _combine_watched_at(watch_date, screening_time)
 
     movie_name_ok     = movie_name     is not None
     watch_date_ok     = watch_date     is not None

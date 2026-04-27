@@ -1,8 +1,9 @@
 """
 영화관 영수증 OCR 서비스 (Tesseract)
 
-이미지 전처리 다중 변형(gray / 자동대비 이진화 / 고대비 샤픈) →
-Tesseract OCR → 점수 가장 높은 텍스트 선택
+영역별(full/top/middle/bottom) 크롭 + 7가지 전처리 variant +
+3가지 Tesseract PSM 조합으로 최고 품질 OCR 텍스트를 추출한다.
+최종 결과는 [TOP]/[MIDDLE]/[BOTTOM] 태그로 구분해 파서에 전달한다.
 
 보안 정책:
   - SSRF 방어: image_url 은 http/https 만 허용하고, 호스트 해석 결과가 사설/
@@ -17,7 +18,8 @@ import re
 import socket
 import ipaddress
 import logging
-from typing import Optional, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
 
 import httpx
@@ -30,25 +32,33 @@ logger = logging.getLogger(__name__)
 # 보안 설정 상수
 # ──────────────────────────────────────────────
 
-_ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+_ALLOWED_SCHEMES: frozenset = frozenset({"http", "https"})
 _MAX_IMAGE_BYTES: int = int(os.getenv("OCR_MAX_IMAGE_BYTES", 10 * 1024 * 1024))
 _DOWNLOAD_TIMEOUT: float = float(os.getenv("OCR_DOWNLOAD_TIMEOUT", 15.0))
-_ALLOWED_HOSTS: frozenset[str] = frozenset(
+_ALLOWED_HOSTS: frozenset = frozenset(
     h.strip().lower() for h in os.getenv("OCR_ALLOWED_HOSTS", "").split(",") if h.strip()
 )
 
-# Tesseract — kor+eng: 한글+영문 혼용 영수증
-# psm 6: 단일 균일 블록, psm 4: 단일 컬럼 (열지 모양 영수증에 유리)
-_TESSERACT_LANG = "kor+eng"
-_CFG_PSM6 = "--oem 3 --psm 6"
-_CFG_PSM4 = "--oem 3 --psm 4"
+# ──────────────────────────────────────────────
+# Tesseract 설정
+# ──────────────────────────────────────────────
 
-# 짧은 변 기준 최소 해상도 (px) — 이 미만이면 업스케일
+_TESSERACT_LANG = "kor+eng"
+_CONFIGS: List[Tuple[str, str]] = [
+    ("psm6",  "--oem 3 --psm 6"),
+    ("psm4",  "--oem 3 --psm 4"),
+    ("psm11", "--oem 3 --psm 11"),
+]
+
+# 짧은 변 기준 최소 해상도 (px)
 _MIN_DIM = 800
+
+# 병렬 OCR 워커 수 (환경변수로 조정 가능)
+_OCR_MAX_WORKERS: int = int(os.getenv("OCR_MAX_WORKERS", 4))
 
 
 # ──────────────────────────────────────────────
-# 공통 전처리 유틸
+# 이미지 전처리 유틸
 # ──────────────────────────────────────────────
 
 def _resize_to_target(img: Image.Image, min_dim: int = _MIN_DIM) -> Image.Image:
@@ -68,139 +78,267 @@ def _crop_receipt_center(img: Image.Image, margin: float = 0.03) -> Image.Image:
     ))
 
 
-def _base_gray(img: Image.Image) -> Image.Image:
-    """RGB → 노이즈 제거 회색조."""
+def _crop_regions(img: Image.Image) -> Dict[str, Image.Image]:
+    """
+    이미지를 4개 관심 영역으로 크롭.
+      full   : 전체 이미지
+      top    : 상단 0~45%  — 영화관명·날짜·영화명·관람등급
+      middle : 중단 35~75% — 좌석·상영관·인원·가격
+      bottom : 하단 70~100% — 결제·환불·사업자 정보
+    """
+    w, h = img.size
+    return {
+        "full":   img,
+        "top":    img.crop((0, 0,           w, int(h * 0.45))),
+        "middle": img.crop((0, int(h * 0.35), w, int(h * 0.75))),
+        "bottom": img.crop((0, int(h * 0.70), w, h)),
+    }
+
+
+# ──────────────────────────────────────────────
+# 이진화 유틸 (OpenCV/NumPy 미사용, 순수 PIL)
+# ──────────────────────────────────────────────
+
+def _otsu_threshold_value(gray: Image.Image) -> int:
+    """Otsu's method 로 최적 이진화 임계값 계산."""
+    hist = gray.histogram()
+    total = sum(hist)
+    total_sum = sum(i * cnt for i, cnt in enumerate(hist))
+    sum_b = weight_b = 0
+    max_var = 0.0
+    threshold = 127
+    for i, cnt in enumerate(hist):
+        weight_b += cnt
+        if weight_b == 0:
+            continue
+        weight_f = total - weight_b
+        if weight_f == 0:
+            break
+        sum_b += i * cnt
+        mean_b = sum_b / weight_b
+        mean_f = (total_sum - sum_b) / weight_f
+        var = weight_b * weight_f * (mean_b - mean_f) ** 2
+        if var > max_var:
+            max_var = var
+            threshold = i
+    return threshold
+
+
+def _otsu_threshold(gray: Image.Image) -> Image.Image:
+    t = _otsu_threshold_value(gray)
+    return gray.point(lambda x: 255 if x > t else 0, "L")
+
+
+def _adaptive_threshold(gray: Image.Image) -> Image.Image:
+    """
+    Gaussian blur 기반 간이 적응형 이진화.
+    각 픽셀을 로컬 평균(블러값)과 비교해 어두운 텍스트를 검정으로 추출.
+    """
+    blurred = gray.filter(ImageFilter.GaussianBlur(radius=15))
+    g_data = gray.getdata()
+    b_data = blurred.getdata()
+    result = bytes(255 if int(g) > int(b) - 10 else 0 for g, b in zip(g_data, b_data))
+    return Image.frombytes("L", gray.size, result)
+
+
+# ──────────────────────────────────────────────
+# 7가지 전처리 variant
+# ──────────────────────────────────────────────
+
+def _make_preprocessing_variants(img: Image.Image) -> List[Tuple[str, Image.Image]]:
+    """
+    (variant_name, 처리된 이미지) 목록 반환.
+    모든 이미지는 "L" (grayscale) mode 로 변환된다.
+    """
     gray = img.convert("L")
-    return gray.filter(ImageFilter.MedianFilter(size=3))
+    gray_med = gray.filter(ImageFilter.MedianFilter(size=3))
+    auto = ImageOps.autocontrast(gray_med, cutoff=2)
 
+    high = ImageEnhance.Contrast(gray_med).enhance(3.0)
+    high = high.filter(ImageFilter.SHARPEN).filter(ImageFilter.SHARPEN)
 
-# ──────────────────────────────────────────────
-# 전처리 변형 3종
-# ──────────────────────────────────────────────
-
-def _variant_gray_enhance(gray: Image.Image) -> Image.Image:
-    """대비 2배 + 밝기 미세 조정 + 샤픈 — 일반 촬영 영수증."""
-    out = ImageEnhance.Contrast(gray).enhance(2.0)
-    out = ImageEnhance.Brightness(out).enhance(1.1)
-    return out.filter(ImageFilter.SHARPEN)
-
-
-def _variant_autocontrast_binary(gray: Image.Image) -> Image.Image:
-    """자동 대비 → 적응형 이진화 — 형광등 그림자·불균일 조명 대응."""
-    out = ImageOps.autocontrast(gray, cutoff=2)
-    pixel_sum = sum(out.getdata())
-    mean_val = pixel_sum / (out.width * out.height)
-    # 평균 밝기보다 약간 밝은 픽셀을 흰색으로: 어두운 이미지는 threshold 낮게
-    threshold = int(min(200, max(110, mean_val * 1.05)))
-    return out.point(lambda x: 255 if x > threshold else 0, "L")
-
-
-def _variant_high_contrast(gray: Image.Image) -> Image.Image:
-    """대비 3배 + 이중 샤픈 — 흐릿하거나 연한 열지 영수증."""
-    out = ImageEnhance.Contrast(gray).enhance(3.0)
-    out = out.filter(ImageFilter.SHARPEN)
-    return out.filter(ImageFilter.SHARPEN)
-
-
-def _preprocess_variants(image_bytes: bytes) -> List[Tuple[str, Image.Image, str]]:
-    """
-    (variant_name, 전처리_이미지, tesseract_config) 목록 반환.
-    각 variant × PSM 조합으로 최대 5회 시도.
-    """
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img = _crop_receipt_center(img)
-    img = _resize_to_target(img)
-    gray = _base_gray(img)
+    sharp = ImageEnhance.Contrast(gray_med).enhance(2.0)
+    sharp = ImageEnhance.Brightness(sharp).enhance(1.1)
+    sharp = sharp.filter(ImageFilter.SHARPEN)
 
     return [
-        ("gray_psm6",          _variant_gray_enhance(gray),        _CFG_PSM6),
-        ("gray_psm4",          _variant_gray_enhance(gray),        _CFG_PSM4),
-        ("autocontrast_psm6",  _variant_autocontrast_binary(gray), _CFG_PSM6),
-        ("autocontrast_psm4",  _variant_autocontrast_binary(gray), _CFG_PSM4),
-        ("high_contrast_psm6", _variant_high_contrast(gray),       _CFG_PSM6),
+        ("original",           gray),
+        ("grayscale",          gray_med),
+        ("autocontrast",       auto),
+        ("high_contrast",      high),
+        ("sharpen",            sharp),
+        ("adaptive_threshold", _adaptive_threshold(gray_med)),
+        ("otsu_threshold",     _otsu_threshold(gray_med)),
     ]
 
 
 # ──────────────────────────────────────────────
-# OCR 품질 점수
+# OCR 품질 점수 (영역별 가중치 포함)
 # ──────────────────────────────────────────────
 
-_SCORE_PATTERNS: List[Tuple[str, float]] = [
-    # 영화관 브랜드
+_BASE_SCORE_PATTERNS: List[Tuple[str, float]] = [
     (r"(?:CGV|메가박스|MEGABOX|롯데\s*시네마|LOTTE\s*CINEMA|B[O0]X\s*KIOSK)", 30.0),
-    # 관람등급
     (r"(?:전체|12세|15세|18세|청소년).{0,4}관람",                               25.0),
-    # 인원/좌석 레이블
     (r"(?:일반|성인|청소년|우대|군인)\s*\d+\s*[명매]",                           20.0),
-    # 날짜
     (r"\d{4}[./-]\d{1,2}[./-]\d{1,2}",                                        20.0),
-    (r"\d{2}[./-]\d{1,2}[./-]\d{1,2}",                                        15.0),
-    # 시간
-    (r"\d{1,2}:\d{2}",                                                         10.0),
-    # 좌석 (열/번 형식)
     (r"[A-Z가-힣]\s*열\s*\d+\s*번?",                                           20.0),
-    # 좌석 코드 (A10, G8 등)
+    (r"\d{2}[./-]\d{1,2}[./-]\d{1,2}",                                        15.0),
     (r"\b[A-Z]\d{1,3}\b",                                                      12.0),
-    # 상영관
     (r"\d+\s*관(?!람|객)",                                                      12.0),
-    # 영화/좌석/상영 관련 키워드 레이블
     (r"(?:영화명|작품명|상영\s*제목)",                                            18.0),
     (r"(?:좌석\s*번호?|SEAT\b)",                                                15.0),
     (r"(?:상영관|관람관|관람일|관람일시|상영일시)",                                 12.0),
-    # 일반 키워드
-    (r"(?:영화|관람|상영|티켓|입장|좌석)",                                         8.0),
-    # 영화 제목 힌트
-    (r"(?:어벤|아바타|오펜하이|파묘|범죄|Avengers|Avatar|Oppenheimer)",           35.0),
+    (r"\d{1,2}:\d{2}",                                                         10.0),
+    (r"(?:영화|관람|상영|티켓|입장|좌석|KIOSK|발권)",                              8.0),
+    (r"\d{1,3}(?:,\d{3})+\s*원",                                                5.0),
 ]
 
+_AREA_EXTRA_PATTERNS: Dict[str, List[Tuple[str, float]]] = {
+    "top": [
+        (r"(?:CGV|메가박스|MEGABOX|롯데\s*시네마|LOTTE\s*CINEMA)", 15.0),
+        (r"(?:전체|12세|15세|18세|청소년).{0,4}관람",              10.0),
+        (r"\d{4}[./-]\d{1,2}[./-]\d{1,2}",                        10.0),
+        (r"KIOSK|발권|전체발권|입장권",                              10.0),
+        (r"[가-힣]{2,}",                                             3.0),
+    ],
+    "middle": [
+        (r"(?:일반|성인|청소년|우대|군인)\s*\d+\s*[명매]", 10.0),
+        (r"[A-Z가-힣]\s*열\s*\d+\s*번?",                  10.0),
+        (r"\b[A-Z]\d{1,3}\b",                              6.0),
+        (r"\d+\s*관(?!람|객)",                              6.0),
+        (r"\d+\s*[명매장]",                                 8.0),
+    ],
+    "bottom": [
+        (r"TOTAL|합계|총금액|총\s*인원",       5.0),
+        (r"사업자|환불|카드|매점|부가세",      -10.0),
+    ],
+    "full": [],
+}
 
-def _ocr_score(text: str) -> float:
+
+def _ocr_score(text: str, area: str = "full") -> float:
     if not text:
         return 0.0
-    score = min(len(text) * 0.3, 80.0)
-    for pattern, boost in _SCORE_PATTERNS:
-        if re.search(pattern, text, re.IGNORECASE):
+    score = min(len(text) * 0.2, 60.0)
+    for pat, boost in _BASE_SCORE_PATTERNS:
+        if re.search(pat, text, re.IGNORECASE):
             score += boost
+    for pat, boost in _AREA_EXTRA_PATTERNS.get(area, []):
+        if re.search(pat, text, re.IGNORECASE):
+            score += boost
+    # 특수문자 비율이 35% 초과 시 감점
+    if len(text) > 10:
+        noise = sum(
+            1 for c in text
+            if not (c.isalnum() or '가' <= c <= '힣' or c in ' \n\t.,:-/()[]　')
+        )
+        if noise / len(text) > 0.35:
+            score -= 20.0
     return score
 
 
 # ──────────────────────────────────────────────
-# 메인 OCR 실행
+# 단일 OCR 실행 (ThreadPoolExecutor 용)
 # ──────────────────────────────────────────────
 
-def _ocr_with_best_variant(image_bytes: bytes) -> Tuple[Optional[str], List[str]]:
-    variants = _preprocess_variants(image_bytes)
-    best_text: Optional[str] = None
-    best_score: float = -1.0
-    all_texts: List[str] = []
+def _run_ocr_task(img: Image.Image, lang: str, config: str) -> str:
+    try:
+        return pytesseract.image_to_string(img, lang=lang, config=config).strip()
+    except Exception as e:
+        logger.warning("Tesseract 실패 — config=%s error=%s", config, e)
+        return ""
 
-    for name, img, cfg in variants:
-        try:
-            text = pytesseract.image_to_string(img, lang=_TESSERACT_LANG, config=cfg)
-            text = text.strip()
-        except Exception as e:
-            logger.warning("OCR 실패 variant=%s error=%s", name, e)
+
+# ──────────────────────────────────────────────
+# 메인 OCR 실행 — 영역별 × variant × PSM 병렬
+# ──────────────────────────────────────────────
+
+def _ocr_multi_region(image_bytes: bytes) -> Tuple[Optional[str], List[str]]:
+    """
+    4개 영역 × 7 variant × 3 PSM 조합으로 OCR 후
+    영역별 최고 점수 텍스트를 [TOP]/[MIDDLE]/[BOTTOM] 태그로 묶어 반환한다.
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img = _crop_receipt_center(img)
+    img = _resize_to_target(img)
+    regions = _crop_regions(img)
+
+    # (area, variant, psm_name, variant_img, config) 태스크 목록
+    tasks: List[Tuple[str, str, str, Image.Image, str]] = []
+    for area_name, area_img in regions.items():
+        for var_name, var_img in _make_preprocessing_variants(area_img):
+            for psm_name, config in _CONFIGS:
+                tasks.append((area_name, var_name, psm_name, var_img, config))
+
+    logger.info("OCR 시작 — 총 %d 조합 (워커=%d)", len(tasks), _OCR_MAX_WORKERS)
+
+    # 병렬 실행
+    ocr_results: List[Tuple[str, str, str, str, float]] = []
+    with ThreadPoolExecutor(max_workers=_OCR_MAX_WORKERS) as executor:
+        future_map = {
+            executor.submit(_run_ocr_task, var_img, _TESSERACT_LANG, config):
+                (area, var, psm)
+            for area, var, psm, var_img, config in tasks
+        }
+        for future in as_completed(future_map):
+            area, var, psm = future_map[future]
+            text = future.result()
+            score = _ocr_score(text, area)
+            ocr_results.append((area, var, psm, text, score))
+            logger.debug(
+                "OCR %-8s %-22s %-5s score=%6.1f chars=%4d  preview=%s",
+                area, var, psm, score, len(text),
+                text[:60].replace("\n", " | "),
+            )
+
+    # 영역별 최고 점수 텍스트 선택
+    area_best: Dict[str, Tuple[str, float, str, str]] = {}
+    for area, var, psm, text, score in ocr_results:
+        if not text:
             continue
+        if area not in area_best or score > area_best[area][1]:
+            area_best[area] = (text, score, var, psm)
 
-        score = _ocr_score(text)
-        logger.info(
-            "── variant=%-22s score=%6.1f  chars=%4d  preview=%s",
-            name, score, len(text), text[:80].replace("\n", " | "),
-        )
+    # 결과 로깅
+    for area in ("full", "top", "middle", "bottom"):
+        if area in area_best:
+            text, score, var, psm = area_best[area]
+            logger.info(
+                "최선 %-8s → variant=%-22s psm=%-5s score=%6.1f chars=%4d",
+                area, var, psm, score, len(text),
+            )
+        else:
+            logger.warning("최선 %-8s → 결과 없음", area)
 
-        if text:
-            all_texts.append(text)
+    if not area_best:
+        return None, []
 
-        if score > best_score:
-            best_score = score
-            best_text = text
+    # all_texts: 영역별 최고 텍스트 목록 (파서 폴백용)
+    all_texts = [info[0] for info in area_best.values() if info[0]]
 
-    logger.info("────────────────────────────────────────────")
-    if not best_text:
-        return None, all_texts
+    top_text    = area_best.get("top",    ("",))[0]
+    middle_text = area_best.get("middle", ("",))[0]
+    bottom_text = area_best.get("bottom", ("",))[0]
+    full_text   = area_best.get("full",   ("",))[0]
 
-    logger.info("최선 variant 선택: score=%.1f  chars=%d", best_score, len(best_text))
-    return best_text, all_texts
+    # [TOP]/[MIDDLE]/[BOTTOM] 섹션 결합
+    sections: List[str] = []
+    if top_text:
+        sections.append(f"[TOP]\n{top_text}")
+        logger.info("[TOP] best:\n%s", top_text[:300])
+    if middle_text:
+        sections.append(f"[MIDDLE]\n{middle_text}")
+        logger.info("[MIDDLE] best:\n%s", middle_text[:200])
+    if bottom_text:
+        sections.append(f"[BOTTOM]\n{bottom_text}")
+        logger.info("[BOTTOM] best:\n%s", bottom_text[:100])
+
+    if sections:
+        combined = "\n".join(sections)
+        logger.info("영역 결합 완료 — 총 chars=%d", len(combined))
+        return combined, all_texts
+
+    return full_text or None, all_texts
 
 
 # ──────────────────────────────────────────────
@@ -303,7 +441,7 @@ async def extract_text_from_url(image_url: str) -> Tuple[Optional[str], List[str
         return None, []
 
     try:
-        best_text, all_texts = _ocr_with_best_variant(image_bytes)
+        best_text, all_texts = _ocr_multi_region(image_bytes)
         if not best_text:
             logger.warning("OCR 추출 결과 없음")
             return None, []
