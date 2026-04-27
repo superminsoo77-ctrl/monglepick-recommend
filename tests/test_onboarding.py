@@ -7,20 +7,31 @@ SQLite 인메모리 DB + FakeRedis를 사용합니다.
 테스트 대상:
 - GET  /api/v1/onboarding/genres: 장르 목록 + 대표 영화
 - POST /api/v1/onboarding/genres: 장르 선택 저장
-- GET  /api/v1/onboarding/worldcup: 월드컵 대진표 생성
+- GET  /api/v1/onboarding/worldcup/categories: 월드컵 카테고리 목록
+- POST /api/v1/onboarding/worldcup/options: 월드컵 시작 가능 라운드 계산
+- POST /api/v1/onboarding/worldcup/start: 월드컵 대진표 생성
 - POST /api/v1/onboarding/worldcup: 월드컵 라운드 결과 제출
 - GET  /api/v1/onboarding/worldcup/result: 월드컵 결과 분석
 - GET  /api/v1/onboarding/moods: 무드 태그 목록
 - POST /api/v1/onboarding/moods: 무드 선택 저장
-- GET  /api/v1/onboarding/status: 온보딩 상태 확인
+- GET  /api/v1/onboarding/status: 시작 미션 상태 확인
 """
 
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.model.entity import Movie, User
+from app.model.entity import (
+    Movie,
+    User,
+    WorldcupCandidate,
+    WorldcupCategory,
+    WorldcupMatch,
+    WorldcupResult,
+    WorldcupSession,
+)
 from tests.conftest import TEST_USER_ID
 
 
@@ -52,13 +63,13 @@ async def _insert_movies_for_worldcup(session: AsyncSession) -> list[Movie]:
     """
     movies = []
     genres_pool = [
-        ["액션", "SF"], ["드라마", "로맨스"], ["코미디", "드라마"],
-        ["스릴러", "범죄"], ["애니메이션", "판타지"], ["액션", "스릴러"],
-        ["SF", "스릴러"], ["로맨스", "코미디"], ["드라마", "범죄"],
-        ["판타지", "액션"], ["액션", "코미디"], ["드라마", "SF"],
-        ["스릴러", "SF"], ["로맨스", "드라마"], ["코미디", "판타지"],
-        ["액션", "판타지"], ["드라마", "스릴러"], ["SF", "판타지"],
-        ["로맨스", "SF"], ["코미디", "액션"],
+        ["액션", "SF"], ["액션", "드라마"], ["액션", "코미디"],
+        ["액션", "스릴러"], ["액션", "판타지"], ["액션", "SF"],
+        ["액션", "드라마"], ["액션", "코미디"], ["액션", "스릴러"],
+        ["액션", "판타지"], ["액션", "SF"], ["액션", "드라마"],
+        ["액션", "코미디"], ["액션", "스릴러"], ["액션", "판타지"],
+        ["액션", "SF"], ["드라마", "로맨스"], ["코미디", "판타지"],
+        ["스릴러", "범죄"], ["SF", "판타지"],
     ]
     titles = [
         "테스트영화A", "테스트영화B", "테스트영화C", "테스트영화D",
@@ -76,6 +87,7 @@ async def _insert_movies_for_worldcup(session: AsyncSession) -> list[Movie]:
             genres=genres_pool[i],
             release_year=2020,
             rating=7.0 + (i % 3) * 0.5,
+            vote_count=150,
             poster_path=f"/test{i + 1}.jpg",
             director=f"감독{i + 1}",
         )
@@ -83,6 +95,82 @@ async def _insert_movies_for_worldcup(session: AsyncSession) -> list[Movie]:
         session.add(movie)
     await session.flush()
     return movies
+
+
+async def _insert_worldcup_category_and_candidates(
+    session: AsyncSession,
+    movies: list[Movie],
+) -> WorldcupCategory:
+    """테스트용 월드컵 카테고리와 활성 후보를 생성합니다."""
+    category = WorldcupCategory(
+        category_code="TEST_ACTION",
+        category_name="테스트 액션 월드컵",
+        description="테스트용 카테고리",
+        display_order=1,
+        is_enabled=True,
+    )
+    session.add(category)
+    await session.flush()
+
+    for movie in movies[:16]:
+        session.add(
+            WorldcupCandidate(
+                movie_id=movie.movie_id,
+                category_id=category.category_id,
+                popularity=10.0,
+                is_active=True,
+            )
+        )
+    await session.flush()
+    return category
+
+
+async def _insert_worldcup_genre_master(session: AsyncSession) -> None:
+    """커스텀 월드컵 장르 목록 테스트용 genre_master 데이터를 생성합니다."""
+    await session.execute(text("DROP TABLE IF EXISTS genre_master"))
+    await session.execute(text("""
+        CREATE TABLE genre_master (
+            genre_id VARCHAR(50) PRIMARY KEY,
+            genre_code VARCHAR(50) NOT NULL,
+            genre_name VARCHAR(100) NOT NULL,
+            contents_count INTEGER NOT NULL,
+            created_at DATETIME NULL,
+            updated_at DATETIME NULL,
+            created_by VARCHAR(50) NULL,
+            updated_by VARCHAR(50) NULL
+        )
+    """))
+    await session.execute(text("""
+        INSERT INTO genre_master (genre_id, genre_code, genre_name, contents_count)
+        VALUES
+          ('g1', 'ACTION', '액션', 250),
+          ('g2', 'ROMANCE', '로맨스', 101),
+          ('g3', 'EROTIC', '에로', 999),
+          ('g4', 'DOCU', '다큐멘터리', 80),
+          ('g5', 'DIVISION', '반공/분단', 500)
+    """))
+    await session.flush()
+
+
+async def _ensure_onboarding_mission_tables(session: AsyncSession) -> None:
+    """시작 미션 상태 테스트용 fav_genre / fav_movie 테이블을 생성합니다."""
+    await session.execute(text("""
+        CREATE TABLE IF NOT EXISTS fav_genre (
+            fav_genre_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id VARCHAR(50) NOT NULL,
+            genre_id VARCHAR(50) NOT NULL,
+            priority INTEGER NULL
+        )
+    """))
+    await session.execute(text("""
+        CREATE TABLE IF NOT EXISTS fav_movie (
+            fav_movie_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id VARCHAR(50) NOT NULL,
+            movie_id VARCHAR(50) NOT NULL,
+            priority INTEGER NULL
+        )
+    """))
+    await session.flush()
 
 
 # =========================================
@@ -136,21 +224,75 @@ async def test_save_genre_selection_min_3(client: AsyncClient, async_session: As
 # =========================================
 
 @pytest.mark.asyncio
-async def test_generate_worldcup_bracket(client: AsyncClient, async_session: AsyncSession):
-    """월드컵 대진표가 올바르게 생성됩니다."""
+async def test_get_worldcup_categories(client: AsyncClient, async_session: AsyncSession):
+    """월드컵 카테고리 목록과 가능 라운드가 반환됩니다."""
+    await _insert_test_user(async_session)
+    movies = await _insert_movies_for_worldcup(async_session)
+    category = await _insert_worldcup_category_and_candidates(async_session, movies)
+
+    response = await client.get("/api/v1/onboarding/worldcup/categories")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert len(data) == 1
+    assert data[0]["categoryId"] == category.category_id
+    assert data[0]["candidatePoolSize"] == 16
+    assert 16 in data[0]["availableRoundSizes"]
+    assert 8 in data[0]["availableRoundSizes"]
+    assert data[0]["previewMovieId"] is not None
+    assert data[0]["previewPosterUrl"] is not None
+    assert data[0]["isReady"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_worldcup_genres(client: AsyncClient, async_session: AsyncSession):
+    """커스텀 월드컵 장르 목록은 genre_master 필터 규칙을 반영합니다."""
+    await _insert_test_user(async_session)
+    await _insert_worldcup_genre_master(async_session)
+
+    response = await client.get("/api/v1/onboarding/worldcup/genres")
+    assert response.status_code == 200
+
+    data = response.json()
+    names = [item["genreName"] for item in data]
+    assert names == ["액션", "로맨스"]
+    assert all(item["contentsCount"] > 100 for item in data)
+
+
+@pytest.mark.asyncio
+async def test_get_worldcup_start_options_for_genre(client: AsyncClient, async_session: AsyncSession):
+    """장르 기반 월드컵의 후보 수와 가능 라운드가 계산됩니다."""
     await _insert_test_user(async_session)
     await _insert_movies_for_worldcup(async_session)
 
-    # 먼저 장르 선택
-    await client.post(
-        "/api/v1/onboarding/genres",
-        json={"selected_genres": ["액션", "SF", "드라마"]},
+    response = await client.post(
+        "/api/v1/onboarding/worldcup/options",
+        json={
+            "sourceType": "GENRE",
+            "selectedGenres": ["액션"],
+        },
     )
+    assert response.status_code == 200
 
-    # 16강 대진표 생성
-    response = await client.get(
-        "/api/v1/onboarding/worldcup",
-        params={"round_size": 16},
+    data = response.json()
+    assert data["sourceType"] == "GENRE"
+    assert data["candidatePoolSize"] >= 16
+    assert 16 in data["availableRoundSizes"]
+
+
+@pytest.mark.asyncio
+async def test_generate_worldcup_bracket(client: AsyncClient, async_session: AsyncSession):
+    """새 시작 요청으로 월드컵 대진표가 올바르게 생성됩니다."""
+    await _insert_test_user(async_session)
+    await _insert_movies_for_worldcup(async_session)
+
+    response = await client.post(
+        "/api/v1/onboarding/worldcup/start",
+        json={
+            "sourceType": "GENRE",
+            "selectedGenres": ["액션"],
+            "roundSize": 16,
+        },
     )
     assert response.status_code == 200
 
@@ -165,6 +307,99 @@ async def test_generate_worldcup_bracket(client: AsyncClient, async_session: Asy
         assert "movie_b" in match
         assert match["movie_a"]["movie_id"] != match["movie_b"]["movie_id"]
 
+    session_result = await async_session.execute(
+        select(WorldcupSession).where(WorldcupSession.user_id == TEST_USER_ID)
+    )
+    saved_session = session_result.scalar_one()
+    assert saved_session.source_type == "GENRE"
+    assert saved_session.current_round == 16
+    assert saved_session.status == "IN_PROGRESS"
+    assert saved_session.completed_at is None
+
+    match_result = await async_session.execute(
+        select(WorldcupMatch)
+        .where(
+            WorldcupMatch.session_id == saved_session.session_id,
+            WorldcupMatch.round_number == 16,
+        )
+        .order_by(WorldcupMatch.match_order.asc())
+    )
+    saved_matches = list(match_result.scalars().all())
+    assert len(saved_matches) == 8
+    assert all(match.winner_movie_id is None for match in saved_matches)
+
+
+@pytest.mark.asyncio
+async def test_generate_worldcup_bracket_prioritizes_more_genre_matches(
+    client: AsyncClient,
+    async_session: AsyncSession,
+):
+    """다중 장르 선택 시 더 많은 선택 장르를 만족하는 영화가 먼저 후보에 포함됩니다."""
+    await _insert_test_user(async_session)
+    await _insert_movies_for_worldcup(async_session)
+
+    response = await client.post(
+        "/api/v1/onboarding/worldcup/start",
+        json={
+            "sourceType": "GENRE",
+            "selectedGenres": ["액션", "SF", "판타지"],
+            "roundSize": 8,
+        },
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    candidate_ids = {
+        match["movie_a"]["movie_id"] for match in data["matches"]
+    } | {
+        match["movie_b"]["movie_id"] for match in data["matches"]
+    }
+
+    # 2개 장르를 만족하는 영화 8편이 정확히 먼저 선발되어야 합니다.
+    expected_priority_ids = {"1000", "1004", "1005", "1009", "1010", "1014", "1015", "1019"}
+    assert candidate_ids == expected_priority_ids
+
+
+@pytest.mark.asyncio
+async def test_start_worldcup_abandons_previous_in_progress_session(
+    client: AsyncClient,
+    async_session: AsyncSession,
+):
+    """새 월드컵 시작 시 기존 진행 중 세션은 ABANDONED 처리됩니다."""
+    await _insert_test_user(async_session)
+    await _insert_movies_for_worldcup(async_session)
+
+    first_resp = await client.post(
+        "/api/v1/onboarding/worldcup/start",
+        json={
+            "sourceType": "GENRE",
+            "selectedGenres": ["액션"],
+            "roundSize": 16,
+        },
+    )
+    assert first_resp.status_code == 200
+
+    second_resp = await client.post(
+        "/api/v1/onboarding/worldcup/start",
+        json={
+            "sourceType": "GENRE",
+            "selectedGenres": ["액션"],
+            "roundSize": 8,
+        },
+    )
+    assert second_resp.status_code == 200
+
+    session_rows = await async_session.execute(
+        select(WorldcupSession)
+        .where(WorldcupSession.user_id == TEST_USER_ID)
+        .order_by(WorldcupSession.session_id.asc())
+    )
+    sessions = list(session_rows.scalars().all())
+    assert len(sessions) == 2
+    assert sessions[0].status == "ABANDONED"
+    assert sessions[1].status == "IN_PROGRESS"
+    assert sessions[1].current_round == 8
+
 
 @pytest.mark.asyncio
 async def test_worldcup_full_flow(client: AsyncClient, async_session: AsyncSession):
@@ -172,21 +407,19 @@ async def test_worldcup_full_flow(client: AsyncClient, async_session: AsyncSessi
     await _insert_test_user(async_session)
     await _insert_movies_for_worldcup(async_session)
 
-    # 1. 장르 선택
-    await client.post(
-        "/api/v1/onboarding/genres",
-        json={"selected_genres": ["액션", "SF", "드라마"]},
-    )
-
-    # 2. 대진표 생성 (16강)
-    bracket_resp = await client.get(
-        "/api/v1/onboarding/worldcup",
-        params={"round_size": 16},
+    # 1. 새 시작 요청으로 대진표 생성 (16강)
+    bracket_resp = await client.post(
+        "/api/v1/onboarding/worldcup/start",
+        json={
+            "sourceType": "GENRE",
+            "selectedGenres": ["액션"],
+            "roundSize": 16,
+        },
     )
     assert bracket_resp.status_code == 200
     bracket = bracket_resp.json()
 
-    # 3. 16강 진행: 각 매치에서 movie_a를 선택 (movie_id는 VARCHAR(50))
+    # 2. 16강 진행: 각 매치에서 movie_a를 선택 (movie_id는 VARCHAR(50))
     selections_16 = [m["movie_a"]["movie_id"] for m in bracket["matches"]]
     round_resp = await client.post(
         "/api/v1/onboarding/worldcup",
@@ -200,7 +433,26 @@ async def test_worldcup_full_flow(client: AsyncClient, async_session: AsyncSessi
     round_data = round_resp.json()
     assert round_data["next_round"] == 8
 
-    # 4. 8강 진행
+    session_result = await async_session.execute(
+        select(WorldcupSession).where(WorldcupSession.user_id == TEST_USER_ID)
+    )
+    saved_session = session_result.scalar_one()
+    assert saved_session.current_round == 8
+    assert saved_session.status == "IN_PROGRESS"
+
+    match_result = await async_session.execute(
+        select(WorldcupMatch)
+        .where(WorldcupMatch.session_id == saved_session.session_id)
+        .order_by(WorldcupMatch.round_number.desc(), WorldcupMatch.match_order.asc())
+    )
+    saved_matches = list(match_result.scalars().all())
+    round_16_matches = [match for match in saved_matches if match.round_number == 16]
+    round_8_matches = [match for match in saved_matches if match.round_number == 8]
+    assert len(round_16_matches) == 8
+    assert len(round_8_matches) == 4
+    assert all(match.winner_movie_id is not None for match in round_16_matches)
+
+    # 3. 8강 진행
     selections_8 = [m["movie_a"]["movie_id"] for m in round_data["next_matches"]]
     round_resp = await client.post(
         "/api/v1/onboarding/worldcup",
@@ -214,7 +466,11 @@ async def test_worldcup_full_flow(client: AsyncClient, async_session: AsyncSessi
     round_data = round_resp.json()
     assert round_data["next_round"] == 4
 
-    # 5. 4강 진행
+    await async_session.refresh(saved_session)
+    assert saved_session.current_round == 4
+    assert saved_session.status == "IN_PROGRESS"
+
+    # 4. 4강 진행
     selections_4 = [m["movie_a"]["movie_id"] for m in round_data["next_matches"]]
     round_resp = await client.post(
         "/api/v1/onboarding/worldcup",
@@ -228,7 +484,11 @@ async def test_worldcup_full_flow(client: AsyncClient, async_session: AsyncSessi
     round_data = round_resp.json()
     assert round_data["next_round"] == 2
 
-    # 6. 결승 진행
+    await async_session.refresh(saved_session)
+    assert saved_session.current_round == 2
+    assert saved_session.status == "IN_PROGRESS"
+
+    # 5. 결승 진행
     final_selection = [round_data["next_matches"][0]["movie_a"]["movie_id"]]
     final_resp = await client.post(
         "/api/v1/onboarding/worldcup",
@@ -242,7 +502,21 @@ async def test_worldcup_full_flow(client: AsyncClient, async_session: AsyncSessi
     final_data = final_resp.json()
     assert final_data["next_round"] is None  # 월드컵 종료
 
-    # 7. 결과 확인
+    await async_session.refresh(saved_session)
+    assert saved_session.status == "COMPLETED"
+    assert saved_session.winner_movie_id == final_selection[0]
+    assert saved_session.completed_at is not None
+
+    final_match_result = await async_session.execute(
+        select(WorldcupMatch)
+        .where(WorldcupMatch.session_id == saved_session.session_id)
+        .order_by(WorldcupMatch.round_number.asc(), WorldcupMatch.match_order.asc())
+    )
+    final_matches = list(final_match_result.scalars().all())
+    assert len(final_matches) == 15
+    assert all(match.winner_movie_id is not None for match in final_matches)
+
+    # 6. 결과 확인
     result_resp = await client.get("/api/v1/onboarding/worldcup/result")
     assert result_resp.status_code == 200
 
@@ -251,6 +525,15 @@ async def test_worldcup_full_flow(client: AsyncClient, async_session: AsyncSessi
     assert "genre_preferences" in result
     assert "top_genres" in result
     assert len(result["top_genres"]) > 0
+
+    result_row = await async_session.execute(
+        select(WorldcupResult)
+        .where(WorldcupResult.user_id == TEST_USER_ID)
+        .order_by(WorldcupResult.created_at.desc())
+        .limit(1)
+    )
+    saved_result = result_row.scalar_one()
+    assert saved_result.session_id == saved_session.session_id
 
 
 # =========================================
@@ -300,38 +583,95 @@ async def test_save_mood_empty(client: AsyncClient, async_session: AsyncSession)
 
 
 # =========================================
-# 온보딩 상태 테스트
+# 시작 미션 상태 테스트
 # =========================================
 
 @pytest.mark.asyncio
 async def test_onboarding_status_initial(client: AsyncClient, async_session: AsyncSession):
-    """초기 상태에서 모든 단계가 미완료입니다."""
+    """초기 상태에서 시작 미션 3개가 모두 미완료입니다."""
     await _insert_test_user(async_session)
+    await _ensure_onboarding_mission_tables(async_session)
 
     response = await client.get("/api/v1/onboarding/status")
     assert response.status_code == 200
 
     data = response.json()
     assert data["is_completed"] is False
-    assert data["genre_selected"] is False
+    assert data["completed_mission_count"] == 0
     assert data["worldcup_completed"] is False
-    assert data["mood_selected"] is False
+    assert data["favorite_genres_completed"] is False
+    assert data["favorite_movies_completed"] is False
+    assert data["favorite_genre_count"] == 0
+    assert data["favorite_movie_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_onboarding_status_after_genre(client: AsyncClient, async_session: AsyncSession):
-    """장르 선택 후 genre_selected만 True입니다."""
+async def test_onboarding_status_after_favorite_genre(client: AsyncClient, async_session: AsyncSession):
+    """선호 장르 저장 후 해당 미션만 완료로 표시됩니다."""
     await _insert_test_user(async_session)
+    await _ensure_onboarding_mission_tables(async_session)
 
-    # 장르 선택
-    await client.post(
-        "/api/v1/onboarding/genres",
-        json={"selected_genres": ["액션", "SF", "드라마"]},
+    await async_session.execute(
+        text(
+            "INSERT INTO fav_genre (user_id, genre_id, priority) "
+            "VALUES (:user_id, :genre_id, :priority)"
+        ),
+        {"user_id": TEST_USER_ID, "genre_id": "g1", "priority": 1},
     )
+    await async_session.flush()
 
     response = await client.get("/api/v1/onboarding/status")
     data = response.json()
-    assert data["genre_selected"] is True
+    assert data["favorite_genres_completed"] is True
+    assert data["favorite_genre_count"] == 1
     assert data["worldcup_completed"] is False
-    assert data["mood_selected"] is False
+    assert data["favorite_movies_completed"] is False
+    assert data["favorite_movie_count"] == 0
+    assert data["completed_mission_count"] == 1
     assert data["is_completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_onboarding_status_all_completed(client: AsyncClient, async_session: AsyncSession):
+    """세 미션 데이터가 모두 있으면 전체 완료로 표시됩니다."""
+    await _insert_test_user(async_session)
+    await _ensure_onboarding_mission_tables(async_session)
+
+    await async_session.execute(
+        text(
+            "INSERT INTO fav_genre (user_id, genre_id, priority) "
+            "VALUES (:user_id, :genre_id, :priority)"
+        ),
+        {"user_id": TEST_USER_ID, "genre_id": "g1", "priority": 1},
+    )
+    await async_session.execute(
+        text(
+            "INSERT INTO fav_movie (user_id, movie_id, priority) "
+            "VALUES (:user_id, :movie_id, :priority)"
+        ),
+        {"user_id": TEST_USER_ID, "movie_id": "1001", "priority": 1},
+    )
+    async_session.add(
+        WorldcupResult(
+            user_id=TEST_USER_ID,
+            round_size=16,
+            winner_movie_id="1001",
+            runner_up_movie_id="1002",
+            onboarding_completed=True,
+            reward_granted=False,
+            total_matches=15,
+        )
+    )
+    await async_session.flush()
+
+    response = await client.get("/api/v1/onboarding/status")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["worldcup_completed"] is True
+    assert data["favorite_genres_completed"] is True
+    assert data["favorite_movies_completed"] is True
+    assert data["favorite_genre_count"] == 1
+    assert data["favorite_movie_count"] == 1
+    assert data["completed_mission_count"] == 3
+    assert data["is_completed"] is True

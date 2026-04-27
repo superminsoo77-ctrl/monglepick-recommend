@@ -1,0 +1,268 @@
+# =========================================
+# 몽글픽 Recommend 운영 배포 워크플로우 (Production CD)
+# =========================================
+# 기준 문서: docs/인프라_배포_가이드.md §6.3 (2026-04-16 최종 운영 배포 실측)
+#
+# 인프라 실체:
+#   - VM2(10.20.0.11) 앱 서버 docker compose
+#     compose 서비스명/컨테이너: **monglepick-recommend**
+#   - 이미지 정책: GHCR (기존 로컬 태그 monglepick-recommend:2.2 에서 전환)
+#   - 환경변수: ~/monglepick/.env.prod → .env 동기화 (§6.3 Step 3-0)
+#
+# 배포 흐름:
+#   1) pytest (SQLite 인메모리, FakeRedis)
+#   2) Docker Buildx linux/amd64 → GHCR push
+#   3) VM1 ProxyJump → VM2 SSH
+#   4) compose 파일 monglepick-recommend 서비스 image: 교체
+#   5) .env.prod → .env
+#   6) docker pull + up -d --no-deps --force-recreate
+#   7) 헬스체크 + 실패 시 compose 백업 복원
+
+name: CD (Production)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "배포할 이미지 태그 (비우면 HEAD SHA 사용)"
+        required: false
+        default: ""
+
+concurrency:
+  group: cd-prod-recommend
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/monglepick-recommend
+  COMPOSE_SERVICE: monglepick-recommend
+  CONTAINER_NAME: monglepick-recommend
+  HEALTHCHECK_URL: http://localhost:8001/health
+  VM2_PROJECT_DIR: /home/ubuntu/monglepick
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Test
+        env:
+          APP_NAME: monglepick-recommend
+          APP_VERSION: 0.1.0
+          DEBUG: "true"
+          API_V1_PREFIX: /api/v1
+          DB_HOST: 127.0.0.1
+          DB_PORT: "3306"
+          DB_NAME: test_db
+          DB_USERNAME: test_user
+          DB_PASSWORD: test_password
+          REDIS_HOST: localhost
+          REDIS_PORT: "6379"
+          REDIS_DB: "1"
+          JWT_SECRET: ci-test-jwt-secret-not-for-production-use-only
+          JWT_ALGORITHM: HS256
+          SERVER_HOST: 0.0.0.0
+          SERVER_PORT: "8001"
+          CORS_ORIGINS: http://localhost:3000,http://localhost:5173
+          TMDB_IMAGE_BASE_URL: https://image.tmdb.org/t/p/w500
+        run: uv run pytest tests/ -v --tb=short -q
+
+  build-and-push:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve image tag
+        id: resolve
+        run: |
+          INPUT_TAG="${{ github.event.inputs.image_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+          else
+            echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "SKIP_BUILD=false" >> $GITHUB_ENV
+          fi
+      - name: Setup Docker Buildx
+        if: env.SKIP_BUILD == 'false'
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        if: env.SKIP_BUILD == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (linux/amd64)
+        if: env.SKIP_BUILD == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.resolve.outputs.tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VM2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Setup SSH (ProxyJump via VM1)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          cat >> ~/.ssh/config <<EOF
+          Host vm1
+            HostName ${{ secrets.VM1_HOST }}
+            User ${{ secrets.VM_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 30
+            ServerAliveCountMax 20
+
+          Host vm2
+            HostName ${{ secrets.VM2_HOST }}
+            User ${{ secrets.VM_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            ProxyJump vm1
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 30
+            ServerAliveCountMax 20
+          EOF
+
+      - name: Deploy via SSH
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          COMPOSE_SERVICE: ${{ env.COMPOSE_SERVICE }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          HEALTHCHECK_URL: ${{ env.HEALTHCHECK_URL }}
+          VM2_PROJECT_DIR: ${{ env.VM2_PROJECT_DIR }}
+          REPO_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          ssh vm2 \
+            IMAGE_TAG="$IMAGE_TAG" \
+            IMAGE_NAME="$IMAGE_NAME" \
+            COMPOSE_SERVICE="$COMPOSE_SERVICE" \
+            CONTAINER_NAME="$CONTAINER_NAME" \
+            HEALTHCHECK_URL="$HEALTHCHECK_URL" \
+            VM2_PROJECT_DIR="$VM2_PROJECT_DIR" \
+            REPO_SOURCE="$REPO_SOURCE" \
+            bash -s <<'REMOTE'
+          set -euo pipefail
+          cd "$VM2_PROJECT_DIR"
+
+          TS=$(date +%Y%m%d-%H%M%S)
+          echo ">>> [1/6] compose 파일 백업: docker-compose.prod.app.yml.bak.$TS"
+          cp docker-compose.prod.app.yml "docker-compose.prod.app.yml.bak.$TS"
+
+          echo ">>> [2/6] .env.prod → .env 동기화 (§6.3 Step 3-0)"
+          cp .env.prod .env
+
+          echo ">>> [3/6] compose image 교체 (service: $COMPOSE_SERVICE)"
+          python3 - <<PY
+          import re, sys, os
+          p = "docker-compose.prod.app.yml"
+          s = open(p).read()
+          service = os.environ["COMPOSE_SERVICE"]
+          new_image = f"{os.environ['IMAGE_NAME']}:{os.environ['IMAGE_TAG']}"
+          pattern = re.compile(
+              r'(^\s{2,4}' + re.escape(service) + r':\s*\n(?:\s{4,}.*\n)*?\s{4,}image:\s*)\S+',
+              re.MULTILINE,
+          )
+          s2, n = pattern.subn(r'\g<1>' + new_image, s, count=1)
+          if n == 0:
+              sys.stderr.write(f"ERROR: service {service} image 라인 찾지 못함\n")
+              sys.exit(1)
+          open(p, "w").write(s2)
+          print(f"image 교체 완료: {new_image}")
+          PY
+
+          # 2026-04-24: pull 전 디스크 자동 정리 — 정책: "running + 신규 = 최대 2개"
+          # VM2 디스크 여유 좁아 (8.7GB) 구 이미지 누적되면 pull 실패 반복.
+          # 본 서비스의 running 중이 아닌 모든 이미지 제거 → running 1개만 남김 → pull 후 정확히 2개.
+          # docker rmi 는 in-use 이미지를 자동 거부하므로 running 컨테이너는 보호된다.
+          echo ">>> [3.5/6] 디스크 사전 정리 (본 서비스 미사용 이미지 전부 제거)"
+          echo "    [dangling] 태그 없는 이미지"
+          docker image prune -f 2>&1 | tail -1 || true
+          echo "    [본 서비스 미사용 이미지] running 제외 전부 제거"
+          docker images "${IMAGE_NAME}" -q 2>/dev/null | sort -u \
+            | xargs -r docker rmi 2>&1 | tail -5 || true
+          echo "    [전역 dangling + 24h 이상] 미사용 이미지"
+          docker image prune -a -f --filter "until=24h" 2>&1 | tail -1 || true
+          echo "    [build cache]"
+          docker builder prune -f --filter "until=24h" 2>&1 | tail -1 || true
+          echo "    정리 후 디스크:"
+          df -h / | head -2
+
+          echo ">>> [4/6] 이미지 pull + 서비스 재시작"
+          PREV_IMAGE_ID=$(docker inspect --format='{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+          echo "    직전 이미지: $PREV_IMAGE_ID"
+          # pull 실패 시 compose 파일이 이미 sed 교체된 상태라 up 도 실패하는 악순환 방지.
+          # pull 단계에서 즉시 백업 복원 후 exit — 다음 실행도 깨끗한 상태.
+          if ! docker pull "${IMAGE_NAME}:${IMAGE_TAG}"; then
+            echo "❌ GHCR pull 실패 — compose 파일 즉시 복원 후 종료 (up 시도 안 함)"
+            cp "docker-compose.prod.app.yml.bak.$TS" docker-compose.prod.app.yml
+            echo "    복원된 image 라인:"
+            grep -E "^\s{4,}image:" docker-compose.prod.app.yml || true
+            exit 1
+          fi
+          docker compose -f docker-compose.prod.app.yml --env-file .env.prod \
+            up -d --no-deps --force-recreate "$COMPOSE_SERVICE"
+
+          echo ">>> [5/6] 헬스체크 (최대 60초)"
+          HEALTHY=false
+          for i in $(seq 1 10); do
+            if curl -sf -m 3 "$HEALTHCHECK_URL" > /dev/null 2>&1; then
+              echo "    ✅ Recommend OK ($i/10)"
+              HEALTHY=true
+              break
+            fi
+            echo "    ⏳ Recommend starting... ($i/10)"
+            sleep 6
+          done
+
+          if [ "$HEALTHY" = "false" ]; then
+            echo "❌ 헬스체크 실패 — compose 백업으로 롤백"
+            cp "docker-compose.prod.app.yml.bak.$TS" docker-compose.prod.app.yml
+            docker compose -f docker-compose.prod.app.yml --env-file .env.prod \
+              up -d --no-deps --force-recreate "$COMPOSE_SERVICE" || true
+            docker inspect "$CONTAINER_NAME" \
+              --format 'RestartCount={{.RestartCount}} Status={{.State.Status}}' || true
+            docker logs "$CONTAINER_NAME" --tail 80 2>&1 | head -80 || true
+            exit 1
+          fi
+
+          echo ">>> [6/6] 구 이미지/백업 정리"
+          docker image prune -f --filter "label=org.opencontainers.image.source=${REPO_SOURCE}" || true
+          find . -maxdepth 1 -name "docker-compose.prod.app.yml.bak.*" -type f -mtime +7 -delete || true
+
+          echo "✅ Recommend 배포 완료: ${IMAGE_NAME}:${IMAGE_TAG}"
+          REMOTE

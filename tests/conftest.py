@@ -13,6 +13,14 @@ SQLite 인메모리 DB와 FakeRedis를 사용하여
 DDL 기준: user_id VARCHAR(50) PK, movie_id VARCHAR(50) PK
 """
 
+# 2026-04-08 — `from __future__ import annotations` 추가:
+# FakeRedis 클래스 본문에 `async def set(...)` 메서드가 정의된 직후
+# `async def smembers(...) -> set[str]:` 어노테이션이 평가되면, Python 은
+# 클래스 namespace 의 `set`(메서드) 를 먼저 찾아 `set[str]` 을 그 메서드의
+# `__getitem__` 호출로 해석한다 → `TypeError: 'function' object is not subscriptable`.
+# 모든 어노테이션을 lazy(string) 평가로 바꿔 builtins.set 이 정상적으로 사용되도록 한다.
+from __future__ import annotations
+
 import asyncio
 import json
 from collections.abc import AsyncGenerator
@@ -34,6 +42,7 @@ from app.config import get_settings
 from app.core.database import Base
 from app.main import app
 from app.api.deps import get_db, get_redis_client, get_current_user, get_current_user_optional
+from app.search_elasticsearch import ElasticsearchSearchClient
 
 
 # ─────────────────────────────────────────
@@ -43,10 +52,21 @@ from app.api.deps import get_db, get_redis_client, get_current_user, get_current
 # StaticPool: 모든 커넥션이 동일한 인메모리 DB를 공유
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
+
+# 2026-04-08 — JSON 직렬화 시 한글 escape 방지.
+# 기본 SQLAlchemy json_serializer 는 json.dumps(...)(ensure_ascii=True)를 사용하여
+# 한글이 \uXXXX 로 저장된다. 이 경우 search 테스트의 LIKE '%"로맨스"%' / '%봉준호%'
+# 패턴이 SQLite 텍스트와 매칭되지 않아 검색 결과가 0건이 된다(test_search 2건 fail).
+# ensure_ascii=False 로 직렬화하여 한글을 그대로 저장 → LIKE 매칭 정상화.
+def _json_serializer_unicode(obj):
+    return json.dumps(obj, ensure_ascii=False)
+
+
 test_engine = create_async_engine(
     TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
+    json_serializer=_json_serializer_unicode,
 )
 
 TestSessionFactory = async_sessionmaker(
@@ -96,25 +116,69 @@ class FakeRedis:
 
     실제 Redis 없이 기본적인 명령(GET, SET, ZADD, ZREVRANGE 등)을
     인메모리 딕셔너리로 시뮬레이션합니다.
+
+    2026-04-07 확장: 좋아요 write-behind 테스트를 위해 Set/Hash/Counter/Rename 지원 강화
+      - String: get, set(NX), setex, incr, decr, delete, exists
+      - Set: sadd, srem, sismember, smembers, scard
+      - Hash: hset, hgetall, hdel, hlen, hget
+      - 기타: rename(atomic), ping, expire, zincrby, zrevrange
     """
 
     def __init__(self):
         self._store: dict[str, str] = {}  # String 저장소
         self._sorted_sets: dict[str, dict[str, float]] = {}  # Sorted Set 저장소
         self._hashes: dict[str, dict[str, str]] = {}  # Hash 저장소
+        self._sets: dict[str, set[str]] = {}  # Set 저장소 (2026-04-07 추가)
         self._ttls: dict[str, int] = {}  # TTL 저장소
 
+    # ─────────────────────────────────
+    # String commands
+    # ─────────────────────────────────
     async def get(self, key: str) -> str | None:
         """String GET"""
         return self._store.get(key)
 
-    async def setex(self, key: str, ttl: int, value: str) -> None:
+    async def set(self, key: str, value, ex: int | None = None, nx: bool = False) -> bool | None:
+        """
+        String SET
+
+        - nx=True: 키가 이미 존재하면 실패 (None 반환)
+        - ex: TTL (초)
+        """
+        if nx and key in self._store:
+            return None
+        self._store[key] = str(value)
+        if ex is not None:
+            self._ttls[key] = ex
+        return True
+
+    async def setex(self, key: str, ttl: int, value) -> None:
         """String SET with TTL"""
-        self._store[key] = value
+        self._store[key] = str(value)
         self._ttls[key] = ttl
 
+    async def incr(self, key: str) -> int:
+        """String INCR — 없으면 0에서 시작해 +1"""
+        current = int(self._store.get(key, "0"))
+        current += 1
+        self._store[key] = str(current)
+        return current
+
+    async def decr(self, key: str) -> int:
+        """String DECR — 없으면 0에서 시작해 -1"""
+        current = int(self._store.get(key, "0"))
+        current -= 1
+        self._store[key] = str(current)
+        return current
+
+    async def exists(self, key: str) -> int:
+        """키 존재 여부 (0 또는 1). 실제 Redis는 멀티 키 지원하지만 단일 키만 흉내."""
+        if key in self._store or key in self._sets or key in self._hashes or key in self._sorted_sets:
+            return 1
+        return 0
+
     async def delete(self, key: str) -> int:
-        """키 삭제"""
+        """키 삭제 (모든 타입 스토어에서 제거)"""
         deleted = 0
         if key in self._store:
             del self._store[key]
@@ -125,8 +189,52 @@ class FakeRedis:
         if key in self._hashes:
             del self._hashes[key]
             deleted += 1
+        if key in self._sets:
+            del self._sets[key]
+            deleted += 1
+        self._ttls.pop(key, None)
         return deleted
 
+    async def rename(self, src: str, dst: str) -> bool:
+        """
+        RENAME src → dst (atomic).
+
+        실제 Redis는 src가 없으면 `ResponseError("no such key")`를 raise 한다.
+        테스트에서도 동일한 예외를 발생시켜 flush의 skip 로직을 검증할 수 있게 한다.
+        """
+        src_type = None
+        if src in self._hashes:
+            src_type = "hash"
+        elif src in self._store:
+            src_type = "string"
+        elif src in self._sets:
+            src_type = "set"
+        elif src in self._sorted_sets:
+            src_type = "zset"
+
+        if src_type is None:
+            import redis.asyncio as aioredis
+            raise aioredis.ResponseError("no such key")
+
+        # dst 기존 데이터 제거
+        await self.delete(dst)
+
+        if src_type == "hash":
+            self._hashes[dst] = self._hashes.pop(src)
+        elif src_type == "string":
+            self._store[dst] = self._store.pop(src)
+        elif src_type == "set":
+            self._sets[dst] = self._sets.pop(src)
+        elif src_type == "zset":
+            self._sorted_sets[dst] = self._sorted_sets.pop(src)
+        # TTL도 이전 (간단화)
+        if src in self._ttls:
+            self._ttls[dst] = self._ttls.pop(src)
+        return True
+
+    # ─────────────────────────────────
+    # Sorted Set commands
+    # ─────────────────────────────────
     async def zincrby(self, key: str, amount: float, member: str) -> float:
         """Sorted Set ZINCRBY"""
         if key not in self._sorted_sets:
@@ -141,7 +249,6 @@ class FakeRedis:
         """Sorted Set ZREVRANGE (score 내림차순)"""
         if key not in self._sorted_sets:
             return []
-        # score 내림차순 정렬
         sorted_items = sorted(
             self._sorted_sets[key].items(),
             key=lambda x: x[1],
@@ -149,22 +256,100 @@ class FakeRedis:
         )
         sliced = sorted_items[start : stop + 1]
         if withscores:
-            return sliced  # [(member, score), ...]
+            return sliced
         return [item[0] for item in sliced]
 
-    async def hset(self, key: str, mapping: dict[str, str] | None = None, **kwargs) -> int:
-        """Hash HSET"""
+    # ─────────────────────────────────
+    # Hash commands
+    # ─────────────────────────────────
+    async def hset(self, key: str, field=None, value=None, mapping: dict[str, str] | None = None, **kwargs) -> int:
+        """
+        Hash HSET
+
+        실제 redis-py는 `hset(key, field, value)` / `hset(key, mapping=...)` 두 형태를 모두 지원한다.
+        여기서도 둘 다 처리한다.
+        """
         if key not in self._hashes:
             self._hashes[key] = {}
+        added = 0
+        if field is not None and value is not None:
+            if field not in self._hashes[key]:
+                added += 1
+            self._hashes[key][field] = str(value)
         if mapping:
-            self._hashes[key].update(mapping)
-        self._hashes[key].update(kwargs)
-        return len(mapping or {}) + len(kwargs)
+            for k, v in mapping.items():
+                if k not in self._hashes[key]:
+                    added += 1
+                self._hashes[key][k] = str(v)
+        for k, v in kwargs.items():
+            if k not in self._hashes[key]:
+                added += 1
+            self._hashes[key][k] = str(v)
+        return added
 
     async def hgetall(self, key: str) -> dict[str, str]:
         """Hash HGETALL"""
-        return self._hashes.get(key, {})
+        return dict(self._hashes.get(key, {}))
 
+    async def hget(self, key: str, field: str) -> str | None:
+        """Hash HGET"""
+        return self._hashes.get(key, {}).get(field)
+
+    async def hdel(self, key: str, *fields: str) -> int:
+        """Hash HDEL — 여러 field를 삭제"""
+        if key not in self._hashes:
+            return 0
+        removed = 0
+        for f in fields:
+            if f in self._hashes[key]:
+                del self._hashes[key][f]
+                removed += 1
+        return removed
+
+    async def hlen(self, key: str) -> int:
+        """Hash HLEN"""
+        return len(self._hashes.get(key, {}))
+
+    # ─────────────────────────────────
+    # Set commands (2026-04-07 추가 — 좋아요 user set 테스트용)
+    # ─────────────────────────────────
+    async def sadd(self, key: str, *members: str) -> int:
+        """Set SADD"""
+        if key not in self._sets:
+            self._sets[key] = set()
+        added = 0
+        for m in members:
+            if m not in self._sets[key]:
+                self._sets[key].add(m)
+                added += 1
+        return added
+
+    async def srem(self, key: str, *members: str) -> int:
+        """Set SREM"""
+        if key not in self._sets:
+            return 0
+        removed = 0
+        for m in members:
+            if m in self._sets[key]:
+                self._sets[key].discard(m)
+                removed += 1
+        return removed
+
+    async def sismember(self, key: str, member: str) -> int:
+        """Set SISMEMBER — 0 또는 1 (redis-py bool 호환)"""
+        return 1 if (key in self._sets and member in self._sets[key]) else 0
+
+    async def smembers(self, key: str) -> set[str]:
+        """Set SMEMBERS"""
+        return set(self._sets.get(key, set()))
+
+    async def scard(self, key: str) -> int:
+        """Set SCARD"""
+        return len(self._sets.get(key, set()))
+
+    # ─────────────────────────────────
+    # Misc
+    # ─────────────────────────────────
     async def expire(self, key: str, ttl: int) -> bool:
         """TTL 설정"""
         self._ttls[key] = ttl
@@ -203,6 +388,26 @@ async def async_session() -> AsyncGenerator[AsyncSession, None]:
 def fake_redis() -> FakeRedis:
     """테스트용 FakeRedis 인스턴스를 반환합니다."""
     return FakeRedis()
+
+
+@pytest.fixture(autouse=True)
+def disable_elasticsearch_for_tests():
+    """
+    검색 API 테스트는 외부 ES 인덱스 대신 인메모리 SQLite 기준으로 검증합니다.
+
+    로컬 ES가 떠 있으면 테스트 DB가 아닌 실인덱스를 조회해 결과가 흔들리므로
+    전체 테스트 동안 ES 검색 경로를 기본 비활성화합니다.
+    """
+    settings = get_settings()
+    original_enabled = settings.SEARCH_ES_ENABLED
+    original_url = settings.ELASTICSEARCH_URL
+    settings.SEARCH_ES_ENABLED = False
+    settings.ELASTICSEARCH_URL = None
+    ElasticsearchSearchClient._shared_capabilities.clear()
+    yield
+    settings.SEARCH_ES_ENABLED = original_enabled
+    settings.ELASTICSEARCH_URL = original_url
+    ElasticsearchSearchClient._shared_capabilities.clear()
 
 
 @pytest_asyncio.fixture

@@ -17,8 +17,13 @@ import logging
 from typing import Optional
 
 import aiomysql
+from pydantic import ValidationError
 
 from app.v2.model.dto import MovieDTO
+from app.repository.movie_repository import (
+    EXCLUDED_SEARCH_CERTIFICATIONS,
+    EXCLUDED_SEARCH_GENRES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +43,15 @@ class MovieRepository:
         keyword: str | None = None,
         search_type: str = "title",
         genre: str | None = None,
+        genres: list[str] | None = None,
+        genre_match_groups: list[list[str]] | None = None,
         year_from: int | None = None,
         year_to: int | None = None,
         rating_min: float | None = None,
         rating_max: float | None = None,
+        popularity_min: float | None = None,
+        popularity_max: float | None = None,
+        vote_count_min: int | None = None,
         sort_by: str = "rating",
         sort_order: str = "desc",
         page: int = 1,
@@ -58,6 +68,8 @@ class MovieRepository:
             year_to: 개봉 연도 끝 (포함)
             rating_min: 최소 평점 (포함)
             rating_max: 최대 평점 (포함)
+            popularity_min: 최소 인기도 (포함)
+            popularity_max: 최대 인기도 (포함)
             sort_by: 정렬 기준 ("rating", "release_year", "title")
             sort_order: 정렬 방향 ("asc", "desc")
             page: 페이지 번호 (1부터 시작)
@@ -72,6 +84,15 @@ class MovieRepository:
         conditions: list[str] = []
         params: list = []
 
+        # 검색 결과 공통 노출 정책을 모든 Raw SQL 경로에 동일하게 적용한다.
+        conditions.append("(adult IS NULL OR adult = 0)")
+        conditions.append(
+            "(certification IS NULL OR certification NOT IN (%s, %s))"
+        )
+        params.extend(list(EXCLUDED_SEARCH_CERTIFICATIONS))
+        conditions.append('(genres IS NULL OR CAST(genres AS CHAR) NOT LIKE %s)')
+        params.append(f'%"{EXCLUDED_SEARCH_GENRES[0]}"%')
+
         # 키워드 검색 필터
         if keyword and keyword.strip():
             keyword_stripped = keyword.strip()
@@ -81,7 +102,7 @@ class MovieRepository:
                 # 통합 검색: 제목 + 감독 + 배우를 OR 조건으로 묶어 검색
                 conditions.append(
                     "(title LIKE %s OR title_en LIKE %s "
-                    "OR director LIKE %s OR CAST(cast AS CHAR) LIKE %s)"
+                    "OR director LIKE %s OR CAST(cast_members AS CHAR) LIKE %s)"
                 )
                 params.extend([like_pattern, like_pattern, like_pattern, like_pattern])
             elif search_type == "title":
@@ -93,14 +114,20 @@ class MovieRepository:
                 conditions.append("director LIKE %s")
                 params.append(like_pattern)
             elif search_type == "actor":
-                # 배우 검색: cast JSON 컬럼에서 LIKE로 검색
-                conditions.append("cast IS NOT NULL AND CAST(cast AS CHAR) LIKE %s")
+                # 배우 검색: cast_members JSON 컬럼에서 LIKE로 검색
+                conditions.append("cast_members IS NOT NULL AND CAST(cast_members AS CHAR) LIKE %s")
                 params.append(like_pattern)
 
         # 장르 필터 (JSON_CONTAINS 사용)
         if genre:
             conditions.append("JSON_CONTAINS(genres, JSON_QUOTE(%s))")
             params.append(genre)
+
+        if genres:
+            unique_genres = list(dict.fromkeys(genres))
+            genre_conditions = ["JSON_CONTAINS(genres, JSON_QUOTE(%s))" for _ in unique_genres]
+            conditions.append(f"({' OR '.join(genre_conditions)})")
+            params.extend(unique_genres)
 
         # 연도 필터
         if year_from is not None:
@@ -117,6 +144,15 @@ class MovieRepository:
         if rating_max is not None:
             conditions.append("rating <= %s")
             params.append(rating_max)
+        if popularity_min is not None:
+            conditions.append("popularity_score >= %s")
+            params.append(popularity_min)
+        if popularity_max is not None:
+            conditions.append("popularity_score <= %s")
+            params.append(popularity_max)
+        if vote_count_min is not None:
+            conditions.append("vote_count >= %s")
+            params.append(vote_count_min)
 
         # WHERE 절 조합
         where_clause = ""
@@ -126,15 +162,45 @@ class MovieRepository:
         # ─────────────────────────────────────
         # 정렬 적용 (NULLS LAST 구현: column IS NULL, column ASC/DESC)
         # ─────────────────────────────────────
-        sort_column_map = {
-            "rating": "rating",
-            "release_year": "release_year",
-            "release_date": "release_year",   # 하위 호환
-            "title": "title",
-        }
-        column = sort_column_map.get(sort_by, "rating")
         direction = "ASC" if sort_order == "asc" else "DESC"
-        order_clause = f"ORDER BY {column} IS NULL, {column} {direction}"
+        sort_parts: list[str] = []
+        sort_params: list = []
+
+        if genre_match_groups:
+            for alias_group in genre_match_groups:
+                unique_aliases = [alias for alias in dict.fromkeys(alias_group) if alias]
+                if not unique_aliases:
+                    continue
+                alias_sql = " OR ".join(["JSON_CONTAINS(genres, JSON_QUOTE(%s))" for _ in unique_aliases])
+                sort_parts.append(f"(CASE WHEN ({alias_sql}) THEN 1 ELSE 0 END) DESC")
+                sort_params.extend(unique_aliases)
+
+        if sort_by == "title":
+            sort_parts.extend([
+                f"title IS NULL ASC",
+                f"title {direction}",
+                "release_year IS NULL ASC",
+                "release_year DESC",
+            ])
+        elif sort_by == "release_date":
+            sort_parts.extend([
+                "release_year IS NULL ASC",
+                f"release_year {direction}",
+                "rating IS NULL ASC",
+                "rating DESC",
+            ])
+        else:
+            column = "rating"
+            sort_parts.extend([
+                f"{column} IS NULL ASC",
+                f"{column} {direction if sort_by == 'rating' else 'DESC'}",
+                "vote_count IS NULL ASC",
+                "vote_count DESC",
+                "release_year IS NULL ASC",
+                "release_year DESC",
+            ])
+
+        order_clause = f"ORDER BY {', '.join(sort_parts)}"
 
         # ─────────────────────────────────────
         # 페이지네이션
@@ -146,7 +212,7 @@ class MovieRepository:
         # 검색 결과 쿼리 실행
         # ─────────────────────────────────────
         select_sql = f"SELECT * FROM movies {where_clause} {order_clause} {limit_clause}"
-        select_params = params + [size, offset]
+        select_params = params + sort_params + [size, offset]
 
         async with self._conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(select_sql, select_params)
@@ -169,18 +235,44 @@ class MovieRepository:
         """
         영화 ID로 단건 조회합니다.
 
+        먼저 movies.movie_id 로 조회하고, 없으면 숫자형 ID에 한해 tmdb_id 로 한 번 더 조회합니다.
+        검색 인덱스/외부 링크가 TMDB ID를 들고 들어오는 경우를 흡수하기 위한 fallback 입니다.
+
         Args:
-            movie_id: 영화 고유 ID (VARCHAR(50))
+            movie_id: 영화 고유 ID (VARCHAR(50)) 또는 TMDB ID 문자열
 
         Returns:
             MovieDTO 또는 None
         """
-        sql = "SELECT * FROM movies WHERE movie_id = %s"
         async with self._conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(sql, (movie_id,))
+            await cur.execute("SELECT * FROM movies WHERE movie_id = %s", (movie_id,))
             row = await cur.fetchone()
+            if row is None and movie_id.isdigit():
+                await cur.execute("SELECT * FROM movies WHERE tmdb_id = %s", (int(movie_id),))
+                row = await cur.fetchone()
 
-        return MovieDTO(**row) if row else None
+        if row is None:
+            return None
+
+        try:
+            return MovieDTO(**row)
+        except ValidationError as exc:
+            logger.error(
+                "movie_detail_row_validation_failed movie_id=%s errors=%s row_excerpt=%s",
+                movie_id,
+                exc.errors(),
+                {
+                    "movie_id": row.get("movie_id"),
+                    "title": row.get("title"),
+                    "release_year": row.get("release_year"),
+                    "runtime": row.get("runtime"),
+                    "rating": row.get("rating"),
+                    "vote_count": row.get("vote_count"),
+                    "adult": row.get("adult"),
+                    "source": row.get("source"),
+                },
+            )
+            raise
 
     async def find_by_ids(self, movie_ids: list[str]) -> list[MovieDTO]:
         """

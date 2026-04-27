@@ -19,10 +19,13 @@ from app.model.schema import (
     MovieDetailResponse,
     MovieSearchResponse,
     RecentSearchResponse,
+    SearchClickLogRequest,
+    SearchClickLogResponse,
     TrendingResponse,
 )
+from app.search_genre_catalog import normalize_search_genre_labels
 from app.v2.service.autocomplete_service import AutocompleteService
-from app.v2.service.search_service import SearchService
+from app.v2.service.search_service import MovieDetailNotFoundError, SearchService
 from app.v2.service.trending_service import TrendingService
 
 logger = logging.getLogger(__name__)
@@ -53,17 +56,23 @@ async def search_movies(
     ),
     # 장르 필터
     genre: str | None = Query(default=None, description="장르 필터 (예: 액션)"),
+    genres: str | None = Query(
+        default=None,
+        description="장르 다중 선택 검색용 라벨 목록 (쉼표 구분, 예: 액션,드라마)",
+    ),
     # 연도 범위
     year_from: int | None = Query(default=None, description="시작 연도 (포함)", ge=1900, le=2030),
     year_to: int | None = Query(default=None, description="끝 연도 (포함)", ge=1900, le=2030),
     # 평점 범위
     rating_min: float | None = Query(default=None, description="최소 평점 (포함)", ge=0.0, le=10.0),
     rating_max: float | None = Query(default=None, description="최대 평점 (포함)", ge=0.0, le=10.0),
+    popularity_min: float | None = Query(default=None, description="최소 인기도 (TMDB popularity_score 기준)", ge=0.0),
+    popularity_max: float | None = Query(default=None, description="최대 인기도 (TMDB popularity_score 기준)", ge=0.0),
     # 정렬
     sort_by: str = Query(
-        default="rating",
-        description="정렬 기준 ('rating', 'release_date', 'title')",
-        pattern="^(rating|release_date|title)$",
+        default="relevance",
+        description="정렬 기준 ('relevance', 'rating', 'release_date', 'title')",
+        pattern="^(relevance|rating|release_date|title)$",
     ),
     sort_order: str = Query(
         default="desc",
@@ -73,6 +82,10 @@ async def search_movies(
     # 페이지네이션
     page: int = Query(default=1, description="페이지 번호 (1부터)", ge=1),
     size: int = Query(default=20, description="페이지 크기 (최대 100)", ge=1, le=100),
+    save_history: bool = Query(
+        default=False,
+        description="최근 검색어 저장 여부 (/search 페이지 검색만 true)",
+    ),
     # 의존성 — v2: aiomysql.Connection
     conn: aiomysql.Connection = Depends(get_conn),
     redis: aioredis.Redis = Depends(get_redis_client),
@@ -81,22 +94,51 @@ async def search_movies(
     """
     영화 검색 엔드포인트
 
-    비로그인 사용자도 검색 가능하며, 로그인 시 검색 이력이 자동 저장됩니다.
+    비로그인 사용자도 검색 가능하며, 최근 검색어 저장은 save_history=true일 때만 수행됩니다.
     """
+    normalized_genres = normalize_search_genre_labels(
+        [item for item in (genres or "").split(",") if item.strip()]
+    )
     service = SearchService(conn, redis)
     return await service.search_movies(
         keyword=q,
         search_type=search_type,
         genre=genre,
+        genres=normalized_genres,
         year_from=year_from,
         year_to=year_to,
         rating_min=rating_min,
         rating_max=rating_max,
+        popularity_min=popularity_min,
+        popularity_max=popularity_max,
         sort_by=sort_by,
         sort_order=sort_order,
         page=page,
         size=size,
         user_id=user_id,
+        save_history=save_history,
+    )
+
+
+@router.post(
+    "/click",
+    response_model=SearchClickLogResponse,
+    summary="검색 결과 클릭 로그 저장",
+    description="검색 결과 목록에서 사용자가 클릭한 영화를 저장합니다.",
+)
+async def log_search_click(
+    payload: SearchClickLogRequest,
+    conn: aiomysql.Connection = Depends(get_conn),
+    user_id: str | None = Depends(get_current_user_optional),
+):
+    """검색 결과 클릭 이벤트 저장 엔드포인트 (v2 Raw SQL)"""
+    service = SearchService(conn)
+    return await service.log_search_click(
+        user_id=user_id,
+        keyword=payload.keyword,
+        clicked_movie_id=payload.clicked_movie_id,
+        result_count=payload.result_count,
+        filters=payload.filters,
     )
 
 
@@ -114,7 +156,7 @@ async def get_movie_detail(
     service = SearchService(conn)
     try:
         return await service.get_movie_detail(movie_id)
-    except ValueError as exc:
+    except MovieDetailNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
@@ -160,13 +202,14 @@ async def get_trending(
     description="로그인 사용자의 최근 검색 이력을 반환합니다. (최대 20건, 최신순)",
 )
 async def get_recent_searches(
+    offset: int = Query(default=0, description="중복 제거된 목록 기준 시작 위치", ge=0),
+    limit: int = Query(default=10, description="페이지당 조회 개수 (최대 10건)", ge=1, le=10),
     conn: aiomysql.Connection = Depends(get_conn),
-    redis: aioredis.Redis = Depends(get_redis_client),
     user_id: str = Depends(get_current_user),
 ):
     """최근 검색어 조회 엔드포인트 (로그인 필수)"""
-    service = SearchService(conn, redis)
-    return await service.get_recent_searches(user_id)
+    service = SearchService(conn)
+    return await service.get_recent_searches(user_id, offset=offset, limit=limit)
 
 
 @router.delete(
@@ -176,11 +219,10 @@ async def get_recent_searches(
 )
 async def delete_all_recent(
     conn: aiomysql.Connection = Depends(get_conn),
-    redis: aioredis.Redis = Depends(get_redis_client),
     user_id: str = Depends(get_current_user),
 ):
     """최근 검색어 전체 삭제 엔드포인트 (로그인 필수)"""
-    service = SearchService(conn, redis)
+    service = SearchService(conn)
     deleted_count = await service.delete_all_recent(user_id)
     return {"message": f"{deleted_count}건의 검색 이력이 삭제되었습니다."}
 
@@ -193,11 +235,10 @@ async def delete_all_recent(
 async def delete_recent_keyword(
     keyword: str,
     conn: aiomysql.Connection = Depends(get_conn),
-    redis: aioredis.Redis = Depends(get_redis_client),
     user_id: str = Depends(get_current_user),
 ):
     """최근 검색어 개별 삭제 엔드포인트 (로그인 필수)"""
-    service = SearchService(conn, redis)
+    service = SearchService(conn)
     success = await service.delete_recent_keyword(user_id, keyword)
     if not success:
         raise HTTPException(
